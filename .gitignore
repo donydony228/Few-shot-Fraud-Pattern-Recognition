@@ -9,3 +9,10 @@ __pycache__/
 *.class
 *.so
 .Python
+
+# Dataset
+MalVis_dataset_small/
+
+# Jupyter Notebook
+playground.ipynb
+meta_learning_in_omniglot(old version).ipynb
