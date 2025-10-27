@@ -1,5 +1,6 @@
 # Virtual Environment
 venv/
+.venv/
 env/
 ENV/
 
@@ -12,7 +13,13 @@ __pycache__/
 
 # Dataset
 MalVis_dataset_small/
+dataset.zip
+dataset/
 
 # Jupyter Notebook
 playground.ipynb
 meta_learning_in_omniglot(old version).ipynb
+
+# Miscellaneous
+__MACOSX
+.DS_Store
