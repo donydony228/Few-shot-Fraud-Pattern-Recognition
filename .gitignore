@@ -4,6 +4,10 @@ venv/
 env/
 ENV/
 
+# Environment varials
+.env
+.env.*
+
 # Python
 __pycache__/
 *.py[cod]
