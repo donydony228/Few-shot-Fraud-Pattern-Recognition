@@ -48,24 +48,25 @@ def plot_training_curves(log_data, save_dir='plots'):
     epochs = [e['epoch'] for e in log_data['epochs']]
     
     # Extract metrics
-    train_loss = [e['train']['loss'] for e in log_data['epochs']]
-    val_loss = [e['val']['loss'] for e in log_data['epochs']]
+    train_loss = [e['train'].get('loss', 0) for e in log_data['epochs']]
+    val_loss = [e['val'].get('loss', 0) for e in log_data['epochs']]
     
-    train_acc = [e['train']['accuracy'] * 100 for e in log_data['epochs']]
-    val_acc = [e['val']['accuracy'] * 100 for e in log_data['epochs']]
+    train_acc = [e['train'].get('accuracy', e['train'].get('acc', 0)) * 100 for e in log_data['epochs']]
+    val_acc = [e['val'].get('accuracy', e['val'].get('acc', 0)) * 100 for e in log_data['epochs']]
     
-    train_f1 = [e['train']['f1_macro'] for e in log_data['epochs']]
-    val_f1 = [e['val']['f1_macro'] for e in log_data['epochs']]
+    train_f1 = [e['train'].get('f1_macro', 0) for e in log_data['epochs']]
+    val_f1 = [e['val'].get('f1_macro', 0) for e in log_data['epochs']]
     
-    train_precision = [e['train']['precision_macro'] for e in log_data['epochs']]
-    val_precision = [e['val']['precision_macro'] for e in log_data['epochs']]
+    train_precision = [e['train'].get('precision', e['train'].get('precision_macro', 0)) for e in log_data['epochs']]
+    val_precision = [e['val'].get('precision', e['val'].get('precision_macro', 0)) for e in log_data['epochs']]
     
-    train_recall = [e['train']['recall_macro'] for e in log_data['epochs']]
-    val_recall = [e['val']['recall_macro'] for e in log_data['epochs']]
+    train_recall = [e['train'].get('recall', e['train'].get('recall_macro', 0)) for e in log_data['epochs']]
+    val_recall = [e['val'].get('recall', e['val'].get('recall_macro', 0)) for e in log_data['epochs']]
     
     # Create figure with subplots (2x2 instead of 2x3)
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle(f"Training Results: {log_data['experiment_name']}", fontsize=16, fontweight='bold')
+    exp_name = log_data.get('experiment_name', 'Training Experiment')
+    fig.suptitle(f"Training Results: {exp_name}", fontsize=16, fontweight='bold')
     
     # Plot 1: Loss
     ax = axes[0, 0]
@@ -118,7 +119,7 @@ def plot_training_curves(log_data, save_dir='plots'):
     plt.tight_layout()
     
     # Save figure
-    exp_name = log_data['experiment_name']
+    exp_name = log_data.get('experiment_name', 'Training Experiment')
     save_path = os.path.join(save_dir, f'{exp_name}_training_curves.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f" Saved training curves to: {save_path}")
@@ -137,7 +138,14 @@ def plot_confusion_matrix(log_data, save_dir='plots', epoch=-1):
     os.makedirs(save_dir, exist_ok=True)
     
     epoch_data = log_data['epochs'][epoch]
-    cm = np.array(epoch_data['val']['confusion_matrix'])
+    # Check if confusion matrix exists in validation data
+    cm_data = epoch_data['val'].get('cm', epoch_data['val'].get('confusion_matrix', None))
+    
+    if cm_data is None:
+        print("⚠️  No confusion matrix data found. Skipping confusion matrix plot.")
+        return
+    
+    cm = np.array(cm_data)
     
     fig, ax = plt.subplots(figsize=(8, 6))
     
@@ -170,7 +178,7 @@ def plot_confusion_matrix(log_data, save_dir='plots', epoch=-1):
     plt.tight_layout()
     
     # Save figure
-    exp_name = log_data['experiment_name']
+    exp_name = log_data.get('experiment_name', 'Training Experiment')
     save_path = os.path.join(save_dir, f'{exp_name}_confusion_matrix_epoch{epoch_data["epoch"]}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f" Saved confusion matrix to: {save_path}")
@@ -190,8 +198,8 @@ def plot_per_class_metrics(log_data, save_dir='plots'):
     fig, ax = plt.subplots(figsize=(10, 6))
     
     for class_idx in range(3):
-        train_f1_class = [e['train']['f1_per_class'][class_idx] for e in log_data['epochs']]
-        val_f1_class = [e['val']['f1_per_class'][class_idx] for e in log_data['epochs']]
+        train_f1_class = [e['train'].get('f1_per_class', [0, 0, 0])[class_idx] for e in log_data['epochs']]
+        val_f1_class = [e['val'].get('f1_per_class', [0, 0, 0])[class_idx] for e in log_data['epochs']]
         
         ax.plot(epochs, train_f1_class, '--', color=colors[class_idx], 
                 label=f'{class_names[class_idx]} (Train)', linewidth=1.5, alpha=0.7)
@@ -208,7 +216,7 @@ def plot_per_class_metrics(log_data, save_dir='plots'):
     plt.tight_layout()
     
     # Save figure
-    exp_name = log_data['experiment_name']
+    exp_name = log_data.get('experiment_name', 'Training Experiment')
     save_path = os.path.join(save_dir, f'{exp_name}_per_class_f1.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f" Saved per-class F1 scores to: {save_path}")
@@ -223,7 +231,7 @@ def print_summary(log_data):
     
     # Hyperparameters
     print("\n Hyperparameters:")
-    hyperparams = log_data['hyperparameters']
+    hyperparams = log_data.get('hyperparameters', log_data.get('config', {}))
     for key, value in hyperparams.items():
         print(f"  {key}: {value}")
     
@@ -232,27 +240,27 @@ def print_summary(log_data):
     last_epoch = log_data['epochs'][-1]
     
     print(f"\n  Training:")
-    print(f"    Loss: {last_epoch['train']['loss']:.4f}")
-    print(f"    Accuracy: {last_epoch['train']['accuracy']*100:.2f}%")
-    print(f"    F1-Macro: {last_epoch['train']['f1_macro']:.4f}")
-    print(f"    Precision: {last_epoch['train']['precision_macro']:.4f}")
-    print(f"    Recall: {last_epoch['train']['recall_macro']:.4f}")
+    print(f"    Loss: {last_epoch['train'].get('loss', 0):.4f}")
+    print(f"    Accuracy: {last_epoch['train'].get('acc', last_epoch['train'].get('accuracy', 0))*100:.2f}%")
+    print(f"    F1-Macro: {last_epoch['train'].get('f1_macro', 0):.4f}")
+    print(f"    Precision: {last_epoch['train'].get('precision', last_epoch['train'].get('precision_macro', 0)):.4f}")
+    print(f"    Recall: {last_epoch['train'].get('recall', last_epoch['train'].get('recall_macro', 0)):.4f}")
     
     print(f"\n  Validation:")
-    print(f"    Loss: {last_epoch['val']['loss']:.4f}")
-    print(f"    Accuracy: {last_epoch['val']['accuracy']*100:.2f}%")
-    print(f"    F1-Macro: {last_epoch['val']['f1_macro']:.4f}")
-    print(f"    Precision: {last_epoch['val']['precision_macro']:.4f}")
-    print(f"    Recall: {last_epoch['val']['recall_macro']:.4f}")
+    print(f"    Loss: {last_epoch['val'].get('loss', 0):.4f}")
+    print(f"    Accuracy: {last_epoch['val'].get('acc', last_epoch['val'].get('accuracy', 0))*100:.2f}%")
+    print(f"    F1-Macro: {last_epoch['val'].get('f1_macro', 0):.4f}")
+    print(f"    Precision: {last_epoch['val'].get('precision', last_epoch['val'].get('precision_macro', 0)):.4f}")
+    print(f"    Recall: {last_epoch['val'].get('recall', last_epoch['val'].get('recall_macro', 0)):.4f}")
     
     # Best epoch
     print("\n Best Validation Accuracy:")
-    val_accs = [e['val']['accuracy'] for e in log_data['epochs']]
+    val_accs = [e['val'].get('acc', e['val'].get('accuracy', 0)) for e in log_data['epochs']]
     best_epoch_idx = np.argmax(val_accs)
     best_epoch = log_data['epochs'][best_epoch_idx]
     print(f"  Epoch: {best_epoch['epoch']}")
-    print(f"  Accuracy: {best_epoch['val']['accuracy']*100:.2f}%")
-    print(f"  F1-Macro: {best_epoch['val']['f1_macro']:.4f}")
+    print(f"  Accuracy: {best_epoch['val'].get('acc', best_epoch['val'].get('accuracy', 0))*100:.2f}%")
+    print(f"  F1-Macro: {best_epoch['val'].get('f1_macro', 0):.4f}")
     
     print("\n" + "="*60)
 
