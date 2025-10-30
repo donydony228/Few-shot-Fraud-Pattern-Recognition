@@ -31,3 +31,6 @@ __MACOSX
 # Logs
 logs/
 *.log
+
+# plot
+plots/
