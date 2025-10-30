@@ -27,3 +27,7 @@ meta_learning_in_omniglot(old version).ipynb
 # Miscellaneous
 __MACOSX
 .DS_Store
+
+# Logs
+logs/
+*.log
