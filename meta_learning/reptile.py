@@ -38,6 +38,11 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
+# Import helper functions from data_loader (without modifying data_loader.py)
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from src.extraction.data_loader import get_label_splits, collect_file_paths
+
 
 # ============================================================================
 # CONFIGURATION
@@ -82,7 +87,10 @@ class CFG:
     else:
         device = "cpu"
 
-    data_json = "../malware_data_structure.json"
+    data_json = "../malware_data_structure.json"  # For JSON-based loading
+    features_dir = "../MalVis_dataset_small/features"  # For CSV-based loading
+    split_csv_path = "../MalVis_dataset_small/label_split.csv"  # For CSV-based loading
+    use_csv_loader = True  # Set to True to use data_loader.py, False to use JSON
     log_dir = "logs"
 
 
@@ -214,6 +222,125 @@ class Logger:
 # ============================================================================
 # DATASET
 # ============================================================================
+
+class CSVBasedMalwareDataset(Dataset):
+    """Dataset class for meta-learning using CSV label splits.
+    
+    This dataset uses helper functions from data_loader.py to load data
+    based on CSV label splits and dynamically generates few-shot tasks.
+    """
+    
+    def __init__(
+        self,
+        features_dir: str,
+        split_csv_path: str,
+        split: str,
+        k_shot: int,
+        q_query: int,
+        n_way: int = 3,
+        input_dim: int = 1280,
+        seed: int = 42,
+        normal_label: str = "benign"
+    ):
+        """Initialize CSV-based dataset.
+        
+        Args:
+            features_dir: Path to features directory
+            split_csv_path: Path to label_split.csv
+            split: 'train', 'val', or 'test'
+            k_shot: Number of support samples per class
+            q_query: Number of query samples per class
+            n_way: Number of classes per task
+            input_dim: Feature dimensionality
+            seed: Random seed
+            normal_label: Name of normal/benign class
+        """
+        # Use helper functions from data_loader.py
+        seen_labels, unseen_labels = get_label_splits(split_csv_path)
+        
+        # Determine which labels to use based on split
+        if split == "train" or split == "val":
+            self.labels = seen_labels
+        else:  # test
+            self.labels = unseen_labels
+        
+        # Collect file paths for each label using helper function
+        all_files = collect_file_paths(features_dir, self.labels)
+        
+        # Organize files by label
+        self.label_to_files = {}
+        for filepath in all_files:
+            label = os.path.basename(os.path.dirname(filepath))
+            if label not in self.label_to_files:
+                self.label_to_files[label] = []
+            self.label_to_files[label].append(filepath)
+        
+        self.k_shot = k_shot
+        self.q_query = q_query
+        self.n_way = n_way
+        self.input_dim = input_dim
+        self.seed = seed
+        self.normal_label = normal_label
+        self.classes = list(self.label_to_files.keys())
+        
+        if len(self.classes) < n_way:
+            raise ValueError(
+                f"Not enough classes ({len(self.classes)}) for {n_way}-way tasks. "
+                f"Available: {self.classes}"
+            )
+    
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        """Generate a single few-shot task."""
+        np.random.seed(self.seed + idx)
+        
+        # Select classes for this task
+        frauds = [c for c in self.classes if c != self.normal_label]
+        if len(frauds) < (self.n_way - 1):
+            raise ValueError(
+                f"Not enough non-normal classes ({len(frauds)}) for {self.n_way}-way task"
+            )
+        
+        selected_frauds = np.random.choice(frauds, self.n_way - 1, replace=False).tolist()
+        
+        if self.normal_label not in self.classes:
+            raise ValueError(f"Normal class '{self.normal_label}' not found")
+        
+        selected = selected_frauds + [self.normal_label]
+        task = []
+        need = self.k_shot + self.q_query
+        
+        for cls in selected:
+            files = self.label_to_files[cls]
+            chosen = np.random.choice(files, need, replace=(len(files) < need))
+            
+            cls_features = []
+            for filepath in chosen:
+                try:
+                    arr = np.load(filepath)
+                    if arr.ndim > 1:
+                        arr = arr.flatten()
+                    
+                    # Ensure correct dimension
+                    if arr.shape[0] != self.input_dim:
+                        if arr.shape[0] < self.input_dim:
+                            arr = np.pad(arr, (0, self.input_dim - arr.shape[0]))
+                        else:
+                            arr = arr[:self.input_dim]
+                    
+                    # Z-score normalization
+                    arr = (arr - arr.mean()) / (arr.std() + 1e-6)
+                except Exception:
+                    arr = np.zeros(self.input_dim, dtype=np.float32)
+                
+                cls_features.append(arr.astype(np.float32))
+            
+            task.append(torch.tensor(np.stack(cls_features), dtype=torch.float32))
+        
+        return torch.stack(task)  # Shape: [n_way, k+q, feat_dim]
+    
+    def __len__(self) -> int:
+        return 100000
+
 
 class MalwareDataset(Dataset):
     """Dataset class for malware feature vectors with few-shot task generation.
@@ -557,11 +684,43 @@ def main():
     logger = Logger()
 
     # Create datasets and data loaders
-    train_ds = MalwareDataset(CFG.data_json, "train", CFG.k_shot, CFG.q_query)
-    val_ds = MalwareDataset(CFG.data_json, "val", CFG.k_shot, CFG.q_query)
-    
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    if CFG.use_csv_loader:
+        # Use CSV-based dataloader (using helper functions from data_loader.py)
+        print(f"Using CSV-based dataloader (via data_loader.py helpers)")
+        print(f"Features dir: {CFG.features_dir}")
+        print(f"Split CSV: {CFG.split_csv_path}")
+        
+        train_ds = CSVBasedMalwareDataset(
+            features_dir=CFG.features_dir,
+            split_csv_path=CFG.split_csv_path,
+            split="train",
+            k_shot=CFG.k_shot,
+            q_query=CFG.q_query,
+            n_way=CFG.n_way,
+            input_dim=CFG.input_dim,
+            seed=42
+        )
+        val_ds = CSVBasedMalwareDataset(
+            features_dir=CFG.features_dir,
+            split_csv_path=CFG.split_csv_path,
+            split="val",
+            k_shot=CFG.k_shot,
+            q_query=CFG.q_query,
+            n_way=CFG.n_way,
+            input_dim=CFG.input_dim,
+            seed=42
+        )
+        
+        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    else:
+        # Use JSON-based dataloader (original method)
+        print(f"Using JSON-based dataloader from {CFG.data_json}")
+        train_ds = MalwareDataset(CFG.data_json, "train", CFG.k_shot, CFG.q_query)
+        val_ds = MalwareDataset(CFG.data_json, "val", CFG.k_shot, CFG.q_query)
+        
+        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
     train_iter = iter(train_loader)
     val_iter = iter(val_loader)
@@ -597,12 +756,12 @@ def main():
                 "val_acc": val_metrics['acc'],
             }, logger.model_path)
             
-            print(f"✅ Saved best model: {logger.model_path} "
+            print(f" Saved best model: {logger.model_path} "
                   f"(val_acc={val_metrics['acc']*100:.2f}%)")
 
     # Training complete
-    print(f"\n✅ Training done. Logs saved at: {logger.path}")
-    print(f"✅ Best model saved at: {logger.model_path}")
+    print(f"\n Training done. Logs saved at: {logger.path}")
+    print(f" Best model saved at: {logger.model_path}")
 
 
 if __name__ == "__main__":
