@@ -43,27 +43,67 @@ def plot_training_curves(log_data, save_dir='plots'):
         log_data: Dictionary containing training log
         save_dir: Directory to save plots
     """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
     os.makedirs(save_dir, exist_ok=True)
     
     epochs = [e['epoch'] for e in log_data['epochs']]
     
-    # Extract metrics
-    train_loss = [e['train'].get('loss', 0) for e in log_data['epochs']]
-    val_loss = [e['val'].get('loss', 0) for e in log_data['epochs']]
+    # Extract metrics with better error handling
+    train_loss = []
+    val_loss = []
+    train_acc = []
+    val_acc = []
+    train_f1 = []
+    val_f1 = []
+    train_precision = []
+    val_precision = []
+    train_recall = []
+    val_recall = []
     
-    train_acc = [e['train'].get('accuracy', e['train'].get('acc', 0)) * 100 for e in log_data['epochs']]
-    val_acc = [e['val'].get('accuracy', e['val'].get('acc', 0)) * 100 for e in log_data['epochs']]
+    for e in log_data['epochs']:
+        # Loss
+        train_loss.append(e['train'].get('loss', 0))
+        val_loss.append(e['val'].get('loss', 0))
+        
+        # Accuracy - 檢查多種可能的key並處理百分比轉換
+        train_acc_val = e['train'].get('acc', e['train'].get('accuracy', 0))
+        val_acc_val = e['val'].get('acc', e['val'].get('accuracy', 0))
+        
+        # 如果值已經是百分比形式（>1），直接使用；否則轉換為百分比
+        if train_acc_val > 1:
+            train_acc.append(train_acc_val)
+        else:
+            train_acc.append(train_acc_val * 100)
+            
+        if val_acc_val > 1:
+            val_acc.append(val_acc_val)
+        else:
+            val_acc.append(val_acc_val * 100)
+        
+        # F1 Score - 使用默認值0如果不存在
+        train_f1.append(e['train'].get('f1_macro', e['train'].get('f1', 0)))
+        val_f1.append(e['val'].get('f1_macro', e['val'].get('f1', 0)))
+        
+        # Precision
+        train_precision.append(e['train'].get('precision_macro', e['train'].get('precision', 0)))
+        val_precision.append(e['val'].get('precision_macro', e['val'].get('precision', 0)))
+        
+        # Recall
+        train_recall.append(e['train'].get('recall_macro', e['train'].get('recall', 0)))
+        val_recall.append(e['val'].get('recall_macro', e['val'].get('recall', 0)))
     
-    train_f1 = [e['train'].get('f1_macro', 0) for e in log_data['epochs']]
-    val_f1 = [e['val'].get('f1_macro', 0) for e in log_data['epochs']]
+    # 檢查數據有效性並提供警告
+    if all(f == 0 for f in train_f1 + val_f1):
+        print("⚠️  Warning: No F1 scores found in data. F1 plot will show zeros.")
+    if all(p == 0 for p in train_precision + val_precision):
+        print("⚠️  Warning: No precision scores found in data. Precision plot will show zeros.")
+    if all(r == 0 for r in train_recall + val_recall):
+        print("⚠️  Warning: No recall scores found in data. Recall plot will show zeros.")
     
-    train_precision = [e['train'].get('precision', e['train'].get('precision_macro', 0)) for e in log_data['epochs']]
-    val_precision = [e['val'].get('precision', e['val'].get('precision_macro', 0)) for e in log_data['epochs']]
-    
-    train_recall = [e['train'].get('recall', e['train'].get('recall_macro', 0)) for e in log_data['epochs']]
-    val_recall = [e['val'].get('recall', e['val'].get('recall_macro', 0)) for e in log_data['epochs']]
-    
-    # Create figure with subplots (2x2 instead of 2x3)
+    # Create figure with subplots (2x2 layout)
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     exp_name = log_data.get('experiment_name', 'Training Experiment')
     fig.suptitle(f"Training Results: {exp_name}", fontsize=16, fontweight='bold')
@@ -93,8 +133,13 @@ def plot_training_curves(log_data, save_dir='plots'):
     
     # Plot 3: F1 Score
     ax = axes[1, 0]
-    ax.plot(epochs, train_f1, 'b-', label='Train F1', linewidth=2, marker='o', markersize=4)
-    ax.plot(epochs, val_f1, 'r-', label='Val F1', linewidth=2, marker='s', markersize=4)
+    if any(f > 0 for f in train_f1 + val_f1):  # 只有在有非零數據時才繪製
+        ax.plot(epochs, train_f1, 'b-', label='Train F1', linewidth=2, marker='o', markersize=4)
+        ax.plot(epochs, val_f1, 'r-', label='Val F1', linewidth=2, marker='s', markersize=4)
+    else:
+        ax.plot(epochs, [0] * len(epochs), 'b-', label='Train F1 (No data)', linewidth=2, alpha=0.5)
+        ax.plot(epochs, [0] * len(epochs), 'r-', label='Val F1 (No data)', linewidth=2, alpha=0.5)
+    
     ax.axhline(y=0.333, color='gray', linestyle='--', label='Random (≈0.333)', alpha=0.5)
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel('F1 Score (Macro)', fontsize=12)
@@ -105,10 +150,18 @@ def plot_training_curves(log_data, save_dir='plots'):
     
     # Plot 4: Precision vs Recall
     ax = axes[1, 1]
-    ax.plot(epochs, train_precision, 'b-', label='Train Precision', linewidth=2, marker='o', markersize=4)
-    ax.plot(epochs, val_precision, 'r-', label='Val Precision', linewidth=2, marker='s', markersize=4)
-    ax.plot(epochs, train_recall, 'b--', label='Train Recall', linewidth=2, marker='^', markersize=4)
-    ax.plot(epochs, val_recall, 'r--', label='Val Recall', linewidth=2, marker='v', markersize=4)
+    if any(p > 0 for p in train_precision + val_precision + train_recall + val_recall):
+        ax.plot(epochs, train_precision, 'b-', label='Train Precision', linewidth=2, marker='o', markersize=4)
+        ax.plot(epochs, val_precision, 'r-', label='Val Precision', linewidth=2, marker='s', markersize=4)
+        ax.plot(epochs, train_recall, 'b--', label='Train Recall', linewidth=2, marker='^', markersize=4)
+        ax.plot(epochs, val_recall, 'r--', label='Val Recall', linewidth=2, marker='v', markersize=4)
+    else:
+        ax.plot(epochs, [0] * len(epochs), 'b-', label='Train Precision (No data)', linewidth=2, alpha=0.5)
+        ax.plot(epochs, [0] * len(epochs), 'r-', label='Val Precision (No data)', linewidth=2, alpha=0.5)
+        ax.plot(epochs, [0] * len(epochs), 'b--', label='Train Recall (No data)', linewidth=2, alpha=0.5)
+        ax.plot(epochs, [0] * len(epochs), 'r--', label='Val Recall (No data)', linewidth=2, alpha=0.5)
+    
+    ax.axhline(y=0.333, color='gray', linestyle='--', label='Random (≈0.333)', alpha=0.5)
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel('Score', fontsize=12)
     ax.set_title('Precision and Recall (Macro Average)', fontsize=13, fontweight='bold')
@@ -122,7 +175,7 @@ def plot_training_curves(log_data, save_dir='plots'):
     exp_name = log_data.get('experiment_name', 'Training Experiment')
     save_path = os.path.join(save_dir, f'{exp_name}_training_curves.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f" Saved training curves to: {save_path}")
+    print(f"📊 Saved training curves to: {save_path}")
     
     plt.show()
 
