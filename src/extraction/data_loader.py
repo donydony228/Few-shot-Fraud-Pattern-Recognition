@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.model_selection import train_test_split
 from typing import List, Tuple, Dict
 import torch
 
@@ -86,32 +87,28 @@ def load_data(
     all_labels = sorted(list(set(seen_labels + unseen_labels)))
     label_to_idx = {label: i for i, label in enumerate(all_labels)}
 
+    np.random.seed(random_seed)
+
+    # Optional one-shot unseen samples
+    one_shot_files = []
     if one_shot:
-        # Add 1 sample per unseen class to seen_files
-        one_shot_files = []
         for label in unseen_labels:
             label_dir = os.path.join(features_dir, label)
             npy_files = [f for f in os.listdir(label_dir) if f.endswith('.npy')]
             if npy_files:
-                np.random.seed(random_seed)
                 one_shot_files.append(os.path.join(label_dir, np.random.choice(npy_files)))
-        # Merge seen_files with 1-shot unseen samples
-        seen_files = seen_files + one_shot_files
-        # -------------------------
+
+    # Split seen files into train/test_seen using sklearn
+    train_files, test_seen_files = train_test_split(seen_files, test_size=test_ratio, random_state=random_seed, shuffle=True)
+
+    # Add one-shot unseen samples to both train and test_seen
+    if one_shot and one_shot_files:
+        train_files += one_shot_files
+        test_seen_files += one_shot_files
 
     # Dataset for seen classes
-    seen_dataset = FeatureDataset(seen_files, label_to_idx, all_labels)
-
-    # Train/Val/Test split for seen classes
-    n_total = len(seen_dataset)
-    n_val = int(val_ratio * n_total)
-    n_test = int(test_ratio * n_total)
-    n_train = n_total - n_val - n_test
-
-    train_set, val_set, test_seen_set = random_split(
-        seen_dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(random_seed)
-    )
+    train_set = FeatureDataset(train_files, label_to_idx, all_labels)
+    test_seen_set = FeatureDataset(test_seen_files, label_to_idx, all_labels)
 
     # Dataset for unseen classes
     if generalized:
@@ -121,16 +118,16 @@ def load_data(
         test_unseen_set = FeatureDataset(unseen_files, label_to_idx, unseen_labels)
 
     datasets = {
-        'seen': seen_dataset,
-        'unseen': test_unseen_set
+        'train': train_set,
+        'test_seen': test_seen_set,
+        'test_unseen': test_unseen_set
     }
 
     # Build DataLoaders
     dataloaders = {
         'train': DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-        'val': DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers),
         'test_seen': DataLoader(test_seen_set, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-        'test_unseen': DataLoader(test_unseen_set, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+        'test_unseen': DataLoader(test_unseen_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     }
 
     return datasets, dataloaders
