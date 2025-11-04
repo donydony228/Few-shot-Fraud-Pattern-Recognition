@@ -89,7 +89,20 @@ def load_data(
 
     np.random.seed(random_seed)
 
-    # Optional one-shot unseen samples
+    # Extract class labels corresponding to each file path
+    seen_file_labels = [os.path.basename(os.path.dirname(p)) for p in seen_files]
+
+    # Stratified split so every seen class appears in both splits
+    train_files, test_seen_files, train_labels, test_seen_labels = train_test_split(
+        seen_files,
+        seen_file_labels,
+        test_size=test_ratio,
+        random_state=random_seed,
+        shuffle=True,
+        stratify=seen_file_labels
+    )
+
+    # One-shot unseen samples (1 sample per unseen class)
     one_shot_files = []
     if one_shot:
         for label in unseen_labels:
@@ -98,11 +111,7 @@ def load_data(
             if npy_files:
                 one_shot_files.append(os.path.join(label_dir, np.random.choice(npy_files)))
 
-    # Split seen files into train/test_seen using sklearn
-    train_files, test_seen_files = train_test_split(seen_files, test_size=test_ratio, random_state=random_seed, shuffle=True)
-
-    # Add one-shot unseen samples to both train and test_seen
-    if one_shot and one_shot_files:
+        # Add one-shot unseen samples to both train and test_seen
         train_files += one_shot_files
         test_seen_files += one_shot_files
 
