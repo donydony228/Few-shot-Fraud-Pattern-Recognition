@@ -1,80 +1,61 @@
-"""Reptile meta-learning algorithm for few-shot malware classification.
-
-This module implements the Reptile algorithm for meta-learning on malware detection
-tasks. It supports few-shot learning scenarios with N-way K-shot classification.
-
-The module includes:
-- Dataset loader for malware feature files
-- Neural network model for malware classification
-- Reptile meta-learning algorithm implementation
-- Training and validation loops
-- Logging and model checkpointing
-
-Example:
-    python reptile.py
-
-Expected data structure:
-    Data should be organized in JSON format with train/val/test splits.
-    Each sample is a .npy file containing 1280-dimensional feature vectors.
+"""
+Reptile Baseline (Nichol et al., 2018)
+Faithful implementation for N-way K-shot classification
+- No cosine head / normalization / pretrain
+- Evaluates best model on seen, unseen, and generalized splits
 """
 
 import os
-import random
+import sys
 import json
-from collections import OrderedDict
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from sklearn.metrics import (
-    f1_score,
-    precision_score,
-    recall_score,
-    confusion_matrix,
+from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+
+# Path to src
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.extraction.data_loader import (
+    create_meta_learning_dataloaders,
+    split_episode_to_support_query
 )
 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
+# =========================================================
+# CONFIG
+# =========================================================
 class CFG:
-    """Configuration parameters for Reptile meta-learning.
-
-    Attributes:
-        n_way: Number of classes in each task (default: 3 for 2 malware + 1 benign).
-        k_shot: Number of support samples per class (default: 1).
-        q_query: Number of query samples per class (default: 5).
-        input_dim: Dimensionality of input features (default: 1280).
-        inner_lr: Learning rate for inner loop (task-specific adaptation).
-        meta_lr: Learning rate for outer loop (meta-learning update).
-        inner_steps: Number of gradient steps in inner loop.
-        meta_batch_size: Number of tasks per meta-update.
-        max_epoch: Maximum number of training epochs.
-        eval_batches: Number of batches for evaluation.
-        device: Computation device (cuda/cpu/mps).
-        data_json: Path to JSON file containing dataset structure.
-        log_dir: Directory for saving logs and model checkpoints.
-    """
+    # Task setup
     n_way = 3
-    k_shot = 1
+    k_shot = 5
     q_query = 5
     input_dim = 1280
 
-    inner_lr = 0.05
-    meta_lr = 0.1
+    # Inner/outer loop
+    inner_lr = 0.01
     inner_steps = 5
-
+    meta_lr = 0.001
     meta_batch_size = 8
+
+    # Training control
+    train_episodes_per_epoch = 200
+    val_episodes_per_epoch = 60
+    test_episodes_per_epoch = 100
     max_epoch = 200
     eval_batches = 10
-    
-    # Device selection with MPS support for MacBook
+
+    # Early stop & LR decay
+    early_stopping_patience = 15
+    lr_decay_patience = 10
+    lr_decay_factor = 0.5
+    min_lr = 1e-6
+
+    # Device
     if torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
@@ -82,528 +63,283 @@ class CFG:
     else:
         device = "cpu"
 
-    data_json = "../malware_data_structure.json"
+    # IO
+    features_dir = "../MalVis_dataset_small/features"
+    split_csv_path = "../MalVis_dataset_small/label_split.csv"
     log_dir = "logs"
 
+    # System
+    seed = 42
+    num_workers = 0
+    pin_memory = torch.cuda.is_available()
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
+# =========================================================
+# Utils
+# =========================================================
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def create_label(n_way: int, num_per_class: int) -> torch.Tensor:
-    """Create labels for N-way classification task.
-
-    Args:
-        n_way: Number of classes.
-        num_per_class: Number of samples per class.
-
-    Returns:
-        Long tensor of shape (n_way * num_per_class,) containing class labels.
-        Example: n_way=3, num_per_class=2 -> [0,0,1,1,2,2]
-    """
     return torch.arange(n_way).repeat_interleave(num_per_class).long()
 
-
 def calculate_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    """Calculate classification accuracy.
-
-    Args:
-        logits: Model predictions of shape (batch_size, n_classes).
-        labels: Ground truth labels of shape (batch_size,).
-
-    Returns:
-        Accuracy as a float between 0 and 1.
-    """
     return (torch.argmax(logits, -1).cpu().numpy() == labels.cpu().numpy()).mean()
 
-
-def calculate_metrics(preds: List[int], labels: List[int],
-                     num_classes: int) -> Dict[str, Any]:
-    """Calculate comprehensive classification metrics.
-
-    Args:
-        preds: List of predicted class indices.
-        labels: List of ground truth class indices.
-        num_classes: Number of classes.
-
-    Returns:
-        Dictionary containing:
-            - acc: Overall accuracy
-            - f1_macro: Macro-averaged F1 score
-            - f1_weighted: Weighted F1 score
-            - precision: Macro-averaged precision
-            - recall: Macro-averaged recall
-            - cm: Confusion matrix as nested list
-    """
+def calculate_metrics(preds: List[int], labels: List[int], num_classes: int) -> Dict[str, Any]:
     preds = np.array(preds)
     labels = np.array(labels)
-    
     return {
         "acc": (preds == labels).mean(),
         "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
-        "f1_weighted": f1_score(labels, preds, average="weighted", zero_division=0),
         "precision": precision_score(labels, preds, average="macro", zero_division=0),
         "recall": recall_score(labels, preds, average="macro", zero_division=0),
         "cm": confusion_matrix(labels, preds).tolist(),
     }
 
-
 class Logger:
-    """Logger for training statistics and model checkpointing.
-    
-    This class manages JSON logging and best model checkpointing during training.
-    It saves epoch-wise metrics and automatically saves the best model based on
-    validation accuracy.
-    """
-    
-    def __init__(self):
-        """Initialize logger with file paths and empty log structure."""
+    def __init__(self, name: str = "reptile_baseline"):
         os.makedirs(CFG.log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        self.path = os.path.join(CFG.log_dir, f"reptile_{timestamp}.json")
-        self.model_path = os.path.join(CFG.log_dir, f"reptile_best_{timestamp}.pth")
-        self.experiment_name = f"reptile_experiment_{timestamp}"
-        
-        # Initialize log structure
-        self.logs = {
-            "experiment_name": self.experiment_name,
-            "config": {
-                k: v for k, v in vars(CFG).items()
-                if not k.startswith("__") and isinstance(
-                    v, (int, float, str, bool, list, type(None))
-                )
-            },
-            "epochs": []
-        }
+        ts = timestamp()
+        self.path = os.path.join(CFG.log_dir, f"{name}_{ts}.json")
+        self.model_path = os.path.join(CFG.log_dir, f"{name}_best_{ts}.pth")
+        self.logs = {"epochs": []}
         self.best_val = -1.0
-        self.best_epoch = 0
 
-    def add(self, epoch: int, train: Dict[str, Any], val: Dict[str, Any]) -> None:
-        """Add epoch statistics to log file.
-
-        Args:
-            epoch: Current epoch number.
-            train: Dictionary of training metrics.
-            val: Dictionary of validation metrics.
-        """
-        self.logs["epochs"].append({
-            "epoch": epoch,
-            "train": train,
-            "val": val
-        })
-        
+    def add(self, epoch: int, train: Dict[str, Any], val: Dict[str, Any]):
+        self.logs["epochs"].append({"epoch": epoch, "train": train, "val": val})
         with open(self.path, "w") as f:
             json.dump(self.logs, f, indent=2)
 
-    def should_save_best(self, val_acc: float) -> bool:
-        """Check if current model is the best so far.
-
-        Args:
-            val_acc: Validation accuracy.
-
-        Returns:
-            True if this is the best model, False otherwise.
-        """
-        if val_acc > self.best_val:
-            self.best_val = val_acc
-            return True
-        return False
-
-
-# ============================================================================
-# DATASET
-# ============================================================================
-
-class MalwareDataset(Dataset):
-    """Dataset class for malware feature vectors with few-shot task generation.
-
-    This dataset loads malware features from JSON structure and dynamically
-    generates few-shot tasks. Each task contains:
-    - 2 randomly selected malware families (abnormal classes)
-    - 1 benign class (normal class)
-    - Total of 3 classes (n_way=3)
-
-    Features are loaded from .npy files and normalized using Z-score normalization.
-    """
-    
-    def __init__(self, json_path: str, split: str, k_shot: int, q_query: int):
-        """Initialize dataset.
-
-        Args:
-            json_path: Path to JSON file containing dataset structure.
-            split: Data split ('train', 'val', or 'test').
-            k_shot: Number of support samples per class.
-            q_query: Number of query samples per class.
-        """
-        with open(json_path, "r") as f:
-            self.data = json.load(f)[split]
-        
-        self.classes = list(self.data.keys())
-        self.k_shot = k_shot
-        self.q_query = q_query
-        self.normal = "benign"
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        """Generate a single few-shot task.
-
-        Args:
-            idx: Task index.
-
-        Returns:
-            Tensor of shape (n_way, k_shot + q_query, input_dim) containing
-            features for one task. The order is: [malware1, malware2, benign].
-        """
-        # Set seed for reproducibility based on task index
-        np.random.seed(42 + idx)
-        
-        # Select 2 malware families randomly
-        frauds = [c for c in self.classes if c != self.normal]
-        selected = np.random.choice(frauds, 2, replace=False).tolist() + [self.normal]
-
-        task = []
-        for cls in selected:
-            # Get file list for this class
-            files = self.data[cls]
-            need = self.k_shot + self.q_query
-            
-            # Sample files (with replacement if necessary)
-            chosen = np.random.choice(files, need, replace=(len(files) < need))
-            
-            cls_features = []
-            for f in chosen:
-                # Try to load and normalize features
-                f = self._fix_path(f)
-                try:
-                    arr = np.load(f)
-                    arr = arr.flatten() if arr.ndim > 1 else arr
-                    # Z-score normalization per sample
-                    arr = (arr - arr.mean()) / (arr.std() + 1e-6)
-                except Exception:
-                    # Fallback to zero vector if loading fails
-                    arr = np.zeros(CFG.input_dim)
-                
-                cls_features.append(arr)
-            
-            task.append(torch.tensor(np.stack(cls_features), dtype=torch.float32))
-        
-        return torch.stack(task)  # Shape: [n_way, k+q, feat_dim]
-
-    def _fix_path(self, path: str) -> str:
-        """Attempt to fix file path by trying common prefixes.
-
-        Args:
-            path: Original file path.
-
-        Returns:
-            Corrected absolute path if file exists, original path otherwise.
-        """
-        if os.path.exists(path):
-            return path
-        
-        # Try common path prefixes
-        for prefix in ["../", "../../", "./"]:
-            candidate = os.path.join(prefix, path)
-            if os.path.exists(candidate):
-                return os.path.abspath(candidate)
-        
-        return path
-
-    def __len__(self) -> int:
-        """Return dataset length (virtual, used by DataLoader).
-
-        Returns:
-            Fixed length of 200 (actual number of tasks is controlled by
-            training loop iterations).
-        """
-        return 200
-
-
-def get_meta_batch(loader: DataLoader, iterator: iter) -> Tuple[torch.Tensor, iter]:
-    """Collect a meta-batch of tasks.
-
-    Args:
-        loader: DataLoader for the dataset.
-        iterator: Current iterator over the loader.
-
-    Returns:
-        Tuple of (batch_tensor, updated_iterator).
-        batch_tensor has shape (meta_batch_size, n_way, k+q, feat_dim).
-    """
-    batch = []
-    for _ in range(CFG.meta_batch_size):
-        try:
-            task = next(iterator)
-        except StopIteration:
-            # Reset iterator if exhausted
-            iterator = iter(loader)
-            task = next(iterator)
-        
-        batch.append(task.squeeze(0).to(CFG.device))
-    
-    return torch.stack(batch), iterator
-
-
-# ============================================================================
-# MODEL
-# ============================================================================
-
+# =========================================================
+# Model (simple MLP)
+# =========================================================
 class MalwareNet(nn.Module):
-    """Neural network for malware classification.
-    
-    Architecture:
-        - LayerNorm(input_dim) -> Dropout(0.3)
-        - Linear(input_dim, hidden) -> ReLU -> Dropout(0.3)
-        - Linear(hidden, hidden) -> ReLU -> Dropout(0.3)
-        - Linear(hidden, n_way)
-    """
-    
-    def __init__(self, input_dim: int = 1280, hidden: int = 512, n_way: int = 3):
-        """Initialize network.
-
-        Args:
-            input_dim: Dimensionality of input features.
-            hidden: Hidden layer size.
-            n_way: Number of output classes.
-        """
+    def __init__(self, input_dim=1280, hidden=512, n_way=3):
         super().__init__()
         self.norm = nn.LayerNorm(input_dim)
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.ReLU(),
-            nn.Dropout(0.3),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden, n_way),
+            nn.Linear(hidden, n_way)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor of shape (batch_size, input_dim) or (input_dim,).
-
-        Returns:
-            Logits tensor of shape (batch_size, n_way).
-        """
-        # Handle single sample case
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        
         x = self.norm(x)
         return self.net(x)
 
-
-# ============================================================================
-# REPTILE ALGORITHM
-# ============================================================================
-
-def reptile_step(model: nn.Module, x: torch.Tensor, loss_fn: nn.Module,
-                train: bool = True) -> Tuple[float, float, List[int], List[int]]:
-    """Perform one Reptile meta-learning step on a batch of tasks.
-
-    Reptile algorithm:
-    1. Initialize with base parameters θ
-    2. For each task:
-       a. Sample support and query loader
-       b. Adapt on support set: θ' = θ - α∇L_support(θ)
-       c. Evaluate on query set and compute meta-gradient
-    3. Meta-update: θ = θ + β * mean(θ' - θ) across all tasks
-
-    Args:
-        model: PyTorch model with parameters to meta-learn.
-        x: Batch of tasks, shape (meta_batch_size, n_way, k+q, feat_dim).
-        loss_fn: Loss function (e.g., CrossEntropyLoss).
-        train: Whether to update model parameters (True for training).
-
-    Returns:
-        Tuple of:
-            - Mean query loss across all tasks
-            - Mean query accuracy across all tasks
-            - All predicted labels (flattened across tasks)
-            - All true labels (flattened across tasks)
-    """
+# =========================================================
+# Reptile Step (faithful to original)
+# =========================================================
+def reptile_step(model: nn.Module,
+                 x: torch.Tensor,
+                 loss_fn: nn.Module,
+                 train: bool = True) -> Tuple[float, float, List[int], List[int]]:
     n_way, k, q = CFG.n_way, CFG.k_shot, CFG.q_query
-    
-    # Store initial parameters (θ)
+
     theta0 = {n: p.data.clone() for n, p in model.named_parameters()}
-    
-    # Accumulate meta-gradient
     meta_delta = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
 
-    task_losses = []
-    task_accs = []
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
+    task_losses, task_accs = [], []
 
     for task in x:
-        # Reset to initial parameters for each task
+        # Reset weights for this task
         with torch.no_grad():
             for n, p in model.named_parameters():
                 p.data.copy_(theta0[n])
 
-        # Split into support and query sets
-        support = task[:, :k, :].reshape(n_way * k, -1)
-        query = task[:, k:, :].reshape(n_way * q, -1)
-        
-        # Create labels
-        y_s = create_label(n_way, k).to(CFG.device)
-        y_q = create_label(n_way, q).to(CFG.device)
+        episode = task.squeeze(0) if task.dim() == 4 else task
+        support, query, y_s, y_q = split_episode_to_support_query(episode, k_shot=k, q_query=q)
+        support, query, y_s, y_q = support.to(CFG.device), query.to(CFG.device), y_s.to(CFG.device), y_q.to(CFG.device)
 
-        # Inner loop: adapt on support set
-        model.train()
+        # Inner loop (adaptation)
         for _ in range(CFG.inner_steps):
+            model.train()
             out = model(support)
             loss = loss_fn(out, y_s)
             model.zero_grad()
             loss.backward()
-            
-            # Gradient step
             with torch.no_grad():
                 for p in model.parameters():
                     if p.grad is not None:
                         p.data -= CFG.inner_lr * p.grad
 
-        # Store adapted parameters (θ')
+        # After adaptation: θ'
         adapted = {n: p.data.clone() for n, p in model.named_parameters()}
 
-        # Evaluate on query set
+        # Evaluate on query
         model.eval()
         with torch.no_grad():
             q_out = model(query)
             q_loss = loss_fn(q_out, y_q)
             acc = calculate_accuracy(q_out, y_q)
             preds = torch.argmax(q_out, -1).cpu().numpy()
-            
-            all_preds.extend(preds)
-            all_labels.extend(y_q.cpu().numpy())
-
         task_losses.append(q_loss.item())
         task_accs.append(acc)
-        
-        # Accumulate meta-gradient (θ' - θ)
+        all_preds.extend(preds)
+        all_labels.extend(y_q.cpu().numpy())
+
+        # accumulate meta update
         with torch.no_grad():
             for n, p in model.named_parameters():
                 meta_delta[n] += adapted[n] - theta0[n]
 
-    # Outer loop: meta-update
     if train:
         with torch.no_grad():
             for n, p in model.named_parameters():
-                # θ = θ + β * mean(θ' - θ)
                 p.data = theta0[n] + CFG.meta_lr * meta_delta[n] / len(x)
 
     return np.mean(task_losses), np.mean(task_accs), all_preds, all_labels
 
-
-# ============================================================================
-# TRAINING
-# ============================================================================
-
-def run_epoch(model: nn.Module, loader: DataLoader, iterator: iter,
-             loss_fn: nn.Module, train: bool) -> Dict[str, Any]:
-    """Run one training or validation epoch.
-
-    Args:
-        model: Model to train/evaluate.
-        loader: DataLoader for the dataset.
-        iterator: Iterator over the loader.
-        loss_fn: Loss function.
-        train: Whether to train the model (True) or evaluate (False).
-
-    Returns:
-        Dictionary of metrics (loss, acc, f1_macro, precision, recall, cm).
-    """
-    losses = []
-    preds = []
-    labels = []
-    
-    # Determine number of batches
-    if train:
-        num_batches = len(loader) // CFG.meta_batch_size
-    else:
-        num_batches = CFG.eval_batches
-
-    for _ in tqdm(range(num_batches), desc="Train" if train else "Val"):
-        # Get meta-batch of tasks
-        x, iterator = get_meta_batch(loader, iterator)
-        
-        # Perform Reptile step
+# =========================================================
+# Epoch loop
+# =========================================================
+def run_epoch(model: nn.Module,
+              loader: DataLoader,
+              loss_fn: nn.Module,
+              train: bool,
+              desc: str) -> Dict[str, Any]:
+    losses, preds, labels = [], [], []
+    num_batches = CFG.train_episodes_per_epoch // CFG.meta_batch_size if train else CFG.eval_batches
+    it = iter(loader)
+    for _ in tqdm(range(num_batches), desc=desc):
+        meta_batch = []
+        for _ in range(CFG.meta_batch_size):
+            try:
+                ep = next(it)
+            except StopIteration:
+                it = iter(loader)
+                ep = next(it)
+            meta_batch.append(ep.squeeze(0).to(CFG.device))
+        x = torch.stack(meta_batch)
         loss, acc, p, y = reptile_step(model, x, loss_fn, train=train)
-        
         losses.append(loss)
         preds.extend(p)
         labels.extend(y)
-    
-    # Compute overall metrics
-    metrics = calculate_metrics(preds, labels, CFG.n_way)
-    metrics["loss"] = float(np.mean(losses))
-    
-    return metrics
+    m = calculate_metrics(preds, labels, CFG.n_way)
+    m["loss"] = float(np.mean(losses))
+    return m
 
+# =========================================================
+# Loader helper
+# =========================================================
+def pick_loader(dls: Dict[str, DataLoader], keys: List[str], name: str):
+    for k in keys:
+        if k in dls:
+            return dls[k]
+    raise KeyError(f"Missing {name} loader. Available keys: {list(dls.keys())}")
 
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-
+# =========================================================
+# Main
+# =========================================================
 def main():
-    """Main training loop for Reptile meta-learning."""
-    print(f"Using device: {CFG.device}")
-    
-    # Initialize model and loss
+    set_seed(CFG.seed)
+    print(f"[Reptile_Baseline] device={CFG.device}  n_way={CFG.n_way}  k_shot={CFG.k_shot}")
+
     model = MalwareNet(CFG.input_dim, hidden=512, n_way=CFG.n_way).to(CFG.device)
     loss_fn = nn.CrossEntropyLoss()
     logger = Logger()
 
-    # Create datasets and data loaders
-    train_ds = MalwareDataset(CFG.data_json, "train", CFG.k_shot, CFG.q_query)
-    val_ds = MalwareDataset(CFG.data_json, "val", CFG.k_shot, CFG.q_query)
-    
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    # Create dataloaders
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    features_dir = os.path.abspath(os.path.join(script_dir, CFG.features_dir))
+    split_csv_path = os.path.abspath(os.path.join(script_dir, CFG.split_csv_path))
+    dataloaders = create_meta_learning_dataloaders(
+        features_dir=features_dir,
+        split_csv_path=split_csv_path,
+        n_way=CFG.n_way,
+        k_shot=CFG.k_shot,
+        q_query=CFG.q_query,
+        train_episodes_per_epoch=CFG.train_episodes_per_epoch,
+        val_episodes_per_epoch=CFG.val_episodes_per_epoch,
+        test_episodes_per_epoch=CFG.test_episodes_per_epoch,
+        normalize=True,
+        num_workers=CFG.num_workers,
+        pin_memory=CFG.pin_memory,
+        seed=CFG.seed
+    )
 
-    train_iter = iter(train_loader)
-    val_iter = iter(val_loader)
+    train_loader = pick_loader(dataloaders, ["train"], "train")
+    val_loader = pick_loader(dataloaders, ["val"], "val")
+    test_seen = pick_loader(dataloaders, ["test_seen"], "test_seen")
+    test_unseen = pick_loader(dataloaders, ["test_unseen"], "test_unseen")
+    test_general = pick_loader(dataloaders, ["test_generalized"], "test_generalized")
 
-    # Training loop
+    print(f"[DataLoader] Ready: train/val/test splits loaded.")
+
+    best_val, patience, lr_wait = -1.0, 0, 0
+    save_path = logger.model_path
+    current_meta_lr = CFG.meta_lr
+
     for epoch in range(1, CFG.max_epoch + 1):
         print(f"\n===== Epoch {epoch}/{CFG.max_epoch} =====")
-        
-        # Train and validate
-        train_metrics = run_epoch(model, train_loader, train_iter, loss_fn, train=True)
-        val_metrics = run_epoch(model, val_loader, val_iter, loss_fn, train=False)
+        print(f"Current meta_lr: {current_meta_lr:.6f}")
 
-        # Print progress
-        print(f"Train Acc: {train_metrics['acc']*100:.2f}% | "
-              f"Val Acc: {val_metrics['acc']*100:.2f}%")
-        
-        # Log metrics
-        logger.add(epoch, train_metrics, val_metrics)
-        
-        # Save best model
-        if logger.should_save_best(val_metrics['acc']):
-            cfg_dict = {
-                k: v for k, v in vars(CFG).items()
-                if not k.startswith("__") and isinstance(
-                    v, (int, float, str, bool, list, type(None))
-                )
-            }
-            
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "cfg": cfg_dict,
-                "epoch": epoch,
-                "val_acc": val_metrics['acc'],
-            }, logger.model_path)
-            
-            print(f"✅ Saved best model: {logger.model_path} "
-                  f"(val_acc={val_metrics['acc']*100:.2f}%)")
+        train_m = run_epoch(model, train_loader, loss_fn, train=True, desc="Train")
+        val_m = run_epoch(model, val_loader, loss_fn, train=False, desc="Val")
 
-    # Training complete
-    print(f"\n✅ Training done. Logs saved at: {logger.path}")
-    print(f"✅ Best model saved at: {logger.model_path}")
+        print(f"Train: acc={train_m['acc']*100:.2f}% loss={train_m['loss']:.4f}")
+        print(f"Val  : acc={val_m['acc']*100:.2f}% loss={val_m['loss']:.4f}")
+        logger.add(epoch, train_m, val_m)
 
+        if val_m["acc"] > best_val:
+            best_val = val_m["acc"]
+            patience, lr_wait = 0, 0
+            torch.save({"model_state_dict": model.state_dict()}, save_path)
+            print(f"✓ Saved best model (val_acc={best_val*100:.2f}%)")
+        else:
+            patience += 1
+            lr_wait += 1
+            print(f"No improvement ({patience}/{CFG.early_stopping_patience})")
+
+        if lr_wait >= CFG.lr_decay_patience:
+            current_meta_lr = max(current_meta_lr * CFG.lr_decay_factor, CFG.min_lr)
+            CFG.meta_lr = current_meta_lr
+            lr_wait = 0
+            print(f"⚠ meta_lr decayed to {current_meta_lr:.6f}")
+
+        if patience >= CFG.early_stopping_patience:
+            print(f"⚠ Early stopping. Best val_acc={best_val*100:.2f}%")
+            break
+
+    print(f"\n✅ Training done. Best val_acc={best_val*100:.2f}%")
+    print(f"Model saved at: {save_path}")
+
+    # ======================
+    # Testing (best model)
+    # ======================
+    if os.path.exists(save_path):
+        state = torch.load(save_path, map_location=CFG.device)
+        model.load_state_dict(state["model_state_dict"])
+        print("\n[Eval] Loaded best model for testing.")
+
+    def evaluate(name: str, loader: DataLoader):
+        m = run_epoch(model, loader, loss_fn, train=False, desc=name)
+        print(f"{name}: acc={m['acc']*100:.2f}% loss={m['loss']:.4f}")
+        return m
+
+    print("\n=== Final Evaluation ===")
+    seen_m = evaluate("test_seen", test_seen)
+    unseen_m = evaluate("test_unseen", test_unseen)
+    general_m = evaluate("test_generalized", test_general)
+
+    print("\n====== Test Summary ======")
+    print(f"Seen:        {seen_m['acc']*100:.2f}%")
+    print(f"Unseen:      {unseen_m['acc']*100:.2f}%")
+    print(f"Generalized: {general_m['acc']*100:.2f}%")
+    print("==========================")
 
 if __name__ == "__main__":
     main()
