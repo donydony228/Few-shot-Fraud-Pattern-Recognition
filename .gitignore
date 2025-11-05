@@ -27,27 +27,3 @@ meta_learning_in_omniglot(old version).ipynb
 # Miscellaneous
 __MACOSX
 .DS_Store
-
-# Generated files
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.bmp
-*.tiff
-
-# Log files
-*.log
-logs/
-*.json
-
-# CSV files
-*.csv
-
-# Model checkpoints
-*.pth
-*.pt
-*.ckpt
-
-# Plots and visualizations
-plots/
