@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader, random_split
 from typing import List, Tuple, Dict, Optional
+
 import torch
 import random
 
@@ -12,9 +13,11 @@ class FeatureDataset(Dataset):
     """
     Dataset for pre-extracted .npy features.
     """
-    def __init__(self, file_paths: List[str], label_to_idx: Dict[str, int]):
+    def __init__(self, file_paths: List[str], label_to_idx: Dict[str, int], class_names: List[str]):
         self.file_paths = file_paths
         self.label_to_idx = label_to_idx
+        self.class_names = class_names
+        self.labels = [val for key, val in label_to_idx.items() if key in class_names]
 
     def __len__(self):
         return len(self.file_paths)
@@ -51,15 +54,16 @@ def collect_file_paths(base_dir: str, labels: List[str]) -> List[str]:
     return paths
 
 
-def create_dataloaders(
+def load_data(
     features_dir: str,
     split_csv_path: str,
     batch_size: int = 64,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     generalized: bool = False,
-    num_workers: int = 4
-) -> Dict[str, DataLoader]:
+    num_workers: int = 4,
+    one_shot = False
+) -> Tuple[Dict[str, FeatureDataset], Dict[str, DataLoader]]:
     """
     Creates PyTorch dataloaders for Zero-Shot Learning setup.
 
@@ -84,33 +88,56 @@ def create_dataloaders(
     all_labels = sorted(list(set(seen_labels + unseen_labels)))
     label_to_idx = {label: i for i, label in enumerate(all_labels)}
 
-    # Dataset for seen classes
-    seen_dataset = FeatureDataset(seen_files, label_to_idx)
+    np.random.seed(random_seed)
 
-    # Train/Val/Test split for seen classes
-    n_total = len(seen_dataset)
-    n_val = int(val_ratio * n_total)
-    n_test = int(test_ratio * n_total)
-    n_train = n_total - n_val - n_test
+    # Extract class labels corresponding to each file path
+    seen_file_labels = [os.path.basename(os.path.dirname(p)) for p in seen_files]
 
-    train_set, val_set, test_seen_set = random_split(
-        seen_dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(random_seed)
+    # Stratified split so every seen class appears in both splits
+    train_files, test_seen_files, train_labels, test_seen_labels = train_test_split(
+        seen_files,
+        seen_file_labels,
+        test_size=test_ratio,
+        random_state=random_seed,
+        shuffle=True,
+        stratify=seen_file_labels
     )
+
+    # One-shot unseen samples (1 sample per unseen class)
+    one_shot_files = []
+    if one_shot:
+        for label in unseen_labels:
+            label_dir = os.path.join(features_dir, label)
+            npy_files = [f for f in os.listdir(label_dir) if f.endswith('.npy')]
+            if npy_files:
+                one_shot_files.append(os.path.join(label_dir, np.random.choice(npy_files)))
+
+        # Add one-shot unseen samples to both train and test_seen
+        train_files += one_shot_files
+        test_seen_files += one_shot_files
+
+    # Dataset for seen classes
+    train_set = FeatureDataset(train_files, label_to_idx, all_labels)
+    test_seen_set = FeatureDataset(test_seen_files, label_to_idx, all_labels)
 
     # Dataset for unseen classes
     if generalized:
         combined_files = seen_files + unseen_files
-        test_unseen_set = FeatureDataset(combined_files, label_to_idx)
+        test_unseen_set = FeatureDataset(combined_files, label_to_idx, all_labels)
     else:
-        test_unseen_set = FeatureDataset(unseen_files, label_to_idx)
+        test_unseen_set = FeatureDataset(unseen_files, label_to_idx, unseen_labels)
+
+    datasets = {
+        'train': train_set,
+        'test_seen': test_seen_set,
+        'test_unseen': test_unseen_set
+    }
 
     # Build DataLoaders
     dataloaders = {
         'train': DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-        'val': DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers),
         'test_seen': DataLoader(test_seen_set, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-        'test_unseen': DataLoader(test_unseen_set, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+        'test_unseen': DataLoader(test_unseen_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     }
 
     return dataloaders
