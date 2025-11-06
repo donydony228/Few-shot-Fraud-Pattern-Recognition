@@ -5,7 +5,7 @@ the FOMAML (First-Order MAML) variant. MI-MAML is designed for few-shot learning
 scenarios with N-way K-shot classification tasks.
 
 The module includes:
-- Dataset loader for malware feature files
+- Dataset loader for malware feature files (using src.extraction.data_loader)
 - Lightweight MLP model with functional forward pass
 - MI-MAML/FOMAML meta-learning implementation
 - Cyclic inner learning rate scheduling
@@ -16,14 +16,16 @@ Example:
     python mi_maml.py
 
 Expected data structure:
-    Data should be organized in JSON format with train/val/test splits.
-    Each sample is a .npy file containing 1280-dimensional feature vectors.
+    Data should be organized in features/{label}/{id}.npy format.
+    label_split.csv should contain train/val/test splits.
+    Each sample is a .npy file containing feature vectors (default 1280-dim).
 """
 
 import math
 import os
 import random
 import json
+import sys
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 
@@ -38,6 +40,13 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     confusion_matrix,
+)
+
+# Add parent directory to path to import src module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.extraction.data_loader import (
+    create_meta_learning_dataloaders,
+    split_episode_to_support_query
 )
 
 
@@ -69,9 +78,14 @@ class CFG:
     """
     # Task setup
     n_way = 3
-    k_shot = 1
+    k_shot = 1  # Number of support samples per class during training
     q_query = 5
     input_dim = 1280
+    
+    # Training/validation/test configuration
+    # Unified config: train=1-shot, val=1-shot, test=1-shot (consistent)
+    val_k_shot = 1  # k_shot for validation (same as training)
+    test_k_shot = 1  # k_shot for testing (same as training)
 
     # Inner / outer loop hyperparameters
     inner_lr = 0.01
@@ -83,9 +97,18 @@ class CFG:
     max_epoch = 200
     train_episodes_per_epoch = 200
     val_episodes_per_epoch = 60
+    test_episodes_per_epoch = 100  # Number of episodes for testing
+    
+    # Early stopping and learning rate scheduling
+    early_stopping_patience = 15  # Stop training if no improvement for 15 epochs
+    lr_decay_factor = 0.5  # Learning rate decay factor
+    lr_decay_patience = 10  # Reduce learning rate if no improvement for 10 epochs
+    min_lr = 1e-6  # Minimum learning rate
 
     # IO configuration
-    data_json = "../malware_data_structure.json"
+    # Paths relative to project root (parent directory of meta_learning/)
+    features_dir = "../MalVis_dataset_small/features"
+    split_csv_path = "../MalVis_dataset_small/label_split.csv"
     log_dir = "logs_mimaml"
 
     # System configuration
@@ -273,138 +296,10 @@ set_seed(CFG.seed)
 # ============================================================================
 # DATASET
 # ============================================================================
-
-class MalwareDataset(Dataset):
-    """Dataset class for malware feature vectors with few-shot task generation.
-
-    This dataset loads malware features from JSON structure and dynamically
-    generates few-shot tasks. Each task contains:
-    - 2 randomly selected malware families (abnormal classes)
-    - 1 benign class (normal class)
-    - Total of 3 classes (n_way=3)
-
-    Features are loaded from .npy files and normalized using Z-score normalization.
-    """
-    
-    def __init__(self, json_path: str, split: str, k_shot: int, q_query: int,
-                 input_dim: int = 1280):
-        """Initialize dataset.
-
-        Args:
-            json_path: Path to JSON file containing dataset structure.
-            split: Data split ('train', 'val', or 'test').
-            k_shot: Number of support samples per class.
-            q_query: Number of query samples per class.
-            input_dim: Dimensionality of input features.
-        """
-        with open(json_path, "r") as f:
-            self.data = json.load(f)[split]
-        
-        self.classes = list(self.data.keys())
-        self.k_shot = k_shot
-        self.q_query = q_query
-        self.input_dim = input_dim
-        self.normal = "benign"
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        """Generate a single few-shot task.
-
-        Args:
-            idx: Task index.
-
-        Returns:
-            Tensor of shape (n_way, k_shot + q_query, input_dim) containing
-            features for one task.
-        """
-        np.random.seed(CFG.seed + idx)
-        
-        # Select 2 malware families + 1 benign
-        frauds = [c for c in self.classes if c != self.normal]
-        if len(frauds) < 2:
-            raise ValueError(
-                "Not enough malware families in JSON for a 3-way task."
-            )
-
-        selected = (
-            np.random.choice(frauds, CFG.n_way - 1, replace=False).tolist()
-            + [self.normal]
-        )
-
-        task = []
-        for cls in selected:
-            files = self.data[cls]
-            need = self.k_shot + self.q_query
-            chosen = np.random.choice(files, need, replace=(len(files) < need))
-            
-            cls_feats = []
-            for filepath in chosen:
-                path = self._fix_path(filepath)
-                
-                try:
-                    arr = np.load(path)
-                    if arr.ndim > 1:
-                        arr = arr.flatten()
-                    # Per-sample Z-score normalization
-                    mu, std = arr.mean(), arr.std()
-                    arr = (arr - mu) / (std + 1e-6)
-                except Exception:
-                    # Fallback to zero vector if loading fails
-                    arr = np.zeros(self.input_dim, dtype=np.float32)
-                
-                cls_feats.append(arr.astype(np.float32))
-            
-            task.append(torch.tensor(np.stack(cls_feats), dtype=torch.float32))
-        
-        return torch.stack(task)  # [n_way, k+q, feat]
-
-    def _fix_path(self, path: str) -> str:
-        """Attempt to fix file path by trying common prefixes.
-
-        Args:
-            path: Original file path.
-
-        Returns:
-            Corrected absolute path if file exists, original path otherwise.
-        """
-        if os.path.exists(path):
-            return path
-        
-        for prefix in ["../", "../../", "./"]:
-            candidate = os.path.join(prefix, path)
-            if os.path.exists(candidate):
-                return os.path.abspath(candidate)
-        
-        return path
-
-    def __len__(self) -> int:
-        """Return virtual dataset length.
-
-        Returns:
-            Large fixed number (actual number of tasks controlled by epochs).
-        """
-        return 100000
-
-
-def make_loader(json_path: str, split: str) -> DataLoader:
-    """Create DataLoader for a given split.
-
-    Args:
-        json_path: Path to JSON file containing dataset structure.
-        split: Data split ('train', 'val', or 'test').
-
-    Returns:
-        DataLoader instance for the specified split.
-    """
-    dataset = MalwareDataset(
-        json_path, split, CFG.k_shot, CFG.q_query, CFG.input_dim
-    )
-    return DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=True,
-        num_workers=CFG.num_workers,
-        pin_memory=CFG.pin_memory
-    )
+# 
+# Note: Old MalwareDataset and make_loader have been removed
+# Now using create_meta_learning_dataloaders from src.extraction.data_loader
+#
 
 
 # ============================================================================
@@ -425,7 +320,7 @@ class MalwareHead(nn.Module):
     """
     
     def __init__(self, input_dim: int = 1280, hidden: int = 512,
-                 n_way: int = 3, p_drop: float = 0.3):
+                 n_way: int = 3, p_drop: float = 0.4):
         """Initialize model.
 
         Args:
@@ -538,21 +433,23 @@ def maml_inner_adapt(model: MalwareHead, task_batch: torch.Tensor,
                      loss_fn: nn.Module = None) -> Tuple[torch.Tensor, float,
                                                           List[torch.Tensor]]:
     """Perform one MI-MAML inner adaptation for a single task.
+    
+    Supports 0-shot learning: when k_shot=0, skip inner loop adaptation and use base parameters directly.
 
     MI-MAML algorithm (FOMAML variant):
     1. Initialize fast_params = clone of base parameters
-    2. For K inner steps:
+    2. For K inner steps (if k_shot > 0):
        a. Compute loss on support set using fast_params
        b. Update: fast_params = fast_params - α_t * grad
        c. Use cyclic learning rate α_t
-    3. Compute query loss using adapted fast_params
+    3. Compute query loss using adapted fast_params (or base params for 0-shot)
     4. Return gradients w.r.t. fast_params (approximate gradient w.r.t. base)
 
     Args:
         model: Model instance (used for ordered_params and functional_forward).
-        task_batch: Batch of one task, shape (1, n_way, k+q, feat_dim).
+        task_batch: Batch of one task, shape (1, n_way, k+q, feat_dim) or (1, n_way, q, feat_dim) for 0-shot.
         n_way: Number of classes.
-        k_shot: Number of support samples per class.
+        k_shot: Number of support samples per class (can be 0).
         q_query: Number of query samples per class.
         inner_steps: Number of inner loop steps.
         inner_base_lr: Base learning rate for inner loop.
@@ -565,37 +462,47 @@ def maml_inner_adapt(model: MalwareHead, task_batch: torch.Tensor,
     if loss_fn is None:
         loss_fn = nn.CrossEntropyLoss()
 
-    task = task_batch.squeeze(0).to(device)  # [n_way, k+q, feat]
-    support = task[:, :k_shot, :].reshape(n_way * k_shot, -1)
-    query = task[:, k_shot:, :].reshape(n_way * q_query, -1)
-
-    y_s = create_label(n_way, k_shot).to(device)
+    task = task_batch.squeeze(0).to(device)  # [n_way, k+q, feat] or [n_way, q, feat] for 0-shot
+    
+    # Split support and query (supports 0-shot)
+    if k_shot > 0:
+        support = task[:, :k_shot, :].reshape(n_way * k_shot, -1)
+        query = task[:, k_shot:, :].reshape(n_way * q_query, -1)
+        y_s = create_label(n_way, k_shot).to(device)
+    else:
+        # 0-shot: all samples are query
+        support = None
+        query = task.reshape(n_way * q_query, -1)
+        y_s = None
+    
     y_q = create_label(n_way, q_query).to(device)
 
     # Initialize fast parameters from base
     base_params = model.ordered_params()
     fast = [p.clone().detach().requires_grad_(True) for p in base_params]
 
-    # Inner loop: adapt on support set
-    for step in range(inner_steps):
-        # Compute cyclic learning rate
-        lr_t = cyclic_inner_lr(inner_base_lr, step, inner_steps)
-        
-        # Forward pass on support set
-        logits_s = functional_forward(model, support, fast)
-        loss_s = loss_fn(logits_s, y_s)
-        
-        # Compute gradients
-        grads = torch.autograd.grad(loss_s, fast, create_graph=False)
-        
-        # Update fast parameters: θ' ← θ' - lr_t * grad
-        fast = [
-            w - lr_t * g if g is not None else w
-            for w, g in zip(fast, grads)
-        ]
-        
-        # Re-enable gradients for next step
-        fast = [w.detach().requires_grad_(True) for w in fast]
+    # Inner loop: adapt on support set (only if k_shot > 0)
+    if k_shot > 0 and inner_steps > 0:
+        for step in range(inner_steps):
+            # Compute cyclic learning rate
+            lr_t = cyclic_inner_lr(inner_base_lr, step, inner_steps)
+            
+            # Forward pass on support set
+            logits_s = functional_forward(model, support, fast)
+            loss_s = loss_fn(logits_s, y_s)
+            
+            # Compute gradients
+            grads = torch.autograd.grad(loss_s, fast, create_graph=False)
+            
+            # Update fast parameters: θ' ← θ' - lr_t * grad
+            fast = [
+                w - lr_t * g if g is not None else w
+                for w, g in zip(fast, grads)
+            ]
+            
+            # Re-enable gradients for next step
+            fast = [w.detach().requires_grad_(True) for w in fast]
+    # else: 0-shot case, fast params remain as copies of base params (no adaptation)
 
     # Compute meta-loss on query set
     logits_q = functional_forward(model, query, fast)
@@ -603,6 +510,7 @@ def maml_inner_adapt(model: MalwareHead, task_batch: torch.Tensor,
     acc_q = (logits_q.argmax(-1) == y_q).float().mean().item()
 
     # Compute gradients w.r.t. fast parameters (approximate base gradients)
+    # For 0-shot, this is equivalent to computing gradients w.r.t. base parameters directly
     grads_q = torch.autograd.grad(loss_q, fast, create_graph=False)
 
     return loss_q.detach(), acc_q, grads_q
@@ -630,7 +538,7 @@ def accumulate_grads(model: MalwareHead,
 # ============================================================================
 
 def run_epoch(train: bool, model: MalwareHead, loader: DataLoader,
-              cfg: CFG) -> Dict[str, float]:
+              cfg: CFG, test_k_shot: int = None) -> Dict[str, float]:
     """Run one training or validation epoch.
 
     Args:
@@ -638,6 +546,7 @@ def run_epoch(train: bool, model: MalwareHead, loader: DataLoader,
         model: Model to train/evaluate.
         loader: DataLoader for the dataset.
         cfg: Configuration object.
+        test_k_shot: k_shot to use for validation/testing (if None, uses cfg.k_shot).
 
     Returns:
         Dictionary of metrics (loss, acc, etc.).
@@ -655,20 +564,24 @@ def run_epoch(train: bool, model: MalwareHead, loader: DataLoader,
     episodes = cfg.train_episodes_per_epoch if train else cfg.val_episodes_per_epoch
     iterator = iter(loader)
 
+    # Determine k_shot to use
+    k_shot_to_use = cfg.k_shot if train else (test_k_shot if test_k_shot is not None else cfg.k_shot)
+
     total_loss = 0.0
     total_acc = 0.0
     meta_batch_grads = None
 
     for episode in tqdm(range(episodes), desc="Train" if train else "Val"):
         try:
-            task = next(iterator)  # [1, n_way, k+q, feat]
+            task = next(iterator)  # [1, n_way, k+q, feat] or [1, n_way, q, feat] for 0-shot
         except StopIteration:
             iterator = iter(loader)
             task = next(iterator)
 
         # Perform inner adaptation for one task
+        # Use cfg.k_shot for training, test_k_shot for validation/testing (can be 0)
         q_loss, q_acc, grads_q = maml_inner_adapt(
-            model, task, cfg.n_way, cfg.k_shot, cfg.q_query,
+            model, task, cfg.n_way, k_shot_to_use, cfg.q_query,
             cfg.inner_steps, cfg.inner_lr, device, loss_fn
         )
 
@@ -720,24 +633,126 @@ def main() -> None:
     # Initialize logger
     logger = Logger(experiment_name="mi_maml")
 
-    # Create data loaders
-    train_loader = make_loader(CFG.data_json, "train")
-    val_loader = make_loader(CFG.data_json, "val")
+    # Create data loaders using new meta-learning dataloader
+    # Convert relative paths to absolute paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    features_dir = os.path.abspath(os.path.join(script_dir, CFG.features_dir))
+    split_csv_path = os.path.abspath(os.path.join(script_dir, CFG.split_csv_path))
+    
+    print(f"\n[DataLoader] Loading from: {features_dir}")
+    print(f"[DataLoader] Split CSV: {split_csv_path}")
+    
+    # Get configuration
+    val_k_shot = getattr(CFG, 'val_k_shot', CFG.k_shot)  # k_shot for validation
+    test_k_shot = getattr(CFG, 'test_k_shot', CFG.k_shot)  # k_shot for testing (default same as training)
+    
+    print(f"\n[Config] Training/Validation/Test Setup:")
+    print(f"  Task: {CFG.n_way}-way, {CFG.k_shot}-shot, {CFG.q_query}-query")
+    print(f"  Train: {CFG.k_shot}-shot")
+    print(f"  Val:   {val_k_shot}-shot")
+    print(f"  Test:  {test_k_shot}-shot")
+    
+    # Create training and validation dataloaders (use same k_shot for consistency)
+    dataloaders_train = create_meta_learning_dataloaders(
+        features_dir=features_dir,
+        split_csv_path=split_csv_path,
+        n_way=CFG.n_way,
+        k_shot=CFG.k_shot,  # Training uses 1-shot
+        q_query=CFG.q_query,
+        train_episodes_per_epoch=CFG.train_episodes_per_epoch,
+        val_episodes_per_epoch=CFG.val_episodes_per_epoch,
+        test_episodes_per_epoch=CFG.test_episodes_per_epoch,
+        normalize=True,
+        num_workers=CFG.num_workers,
+        pin_memory=CFG.pin_memory,
+        seed=CFG.seed
+    )
+    
+    train_loader = dataloaders_train['train']
+    
+    # Create validation dataloader (use val_k_shot)
+    if val_k_shot != CFG.k_shot:
+        dataloaders_val = create_meta_learning_dataloaders(
+            features_dir=features_dir,
+            split_csv_path=split_csv_path,
+            n_way=CFG.n_way,
+            k_shot=val_k_shot,
+            q_query=CFG.q_query,
+            train_episodes_per_epoch=CFG.train_episodes_per_epoch,
+            val_episodes_per_epoch=CFG.val_episodes_per_epoch,
+            test_episodes_per_epoch=CFG.test_episodes_per_epoch,
+            normalize=True,
+            num_workers=CFG.num_workers,
+            pin_memory=CFG.pin_memory,
+            seed=CFG.seed
+        )
+        val_loader = dataloaders_val['val']
+        print(f"[DataLoader] Validation uses separate {val_k_shot}-shot dataloader")
+    else:
+        val_loader = dataloaders_train['val']
+        print(f"[DataLoader] Validation uses same {CFG.k_shot}-shot dataloader as training")
+    
+    # Create test dataloaders (use test_k_shot)
+    if test_k_shot != CFG.k_shot:
+        dataloaders_test = create_meta_learning_dataloaders(
+            features_dir=features_dir,
+            split_csv_path=split_csv_path,
+            n_way=CFG.n_way,
+            k_shot=test_k_shot,  # Testing uses specified k_shot
+            q_query=CFG.q_query,
+            train_episodes_per_epoch=CFG.train_episodes_per_epoch,
+            val_episodes_per_epoch=CFG.val_episodes_per_epoch,
+            test_episodes_per_epoch=CFG.test_episodes_per_epoch,
+            normalize=True,
+            num_workers=CFG.num_workers,
+            pin_memory=CFG.pin_memory,
+            seed=CFG.seed
+        )
+        test_loaders = {
+            'test_seen': dataloaders_test['test_seen'],
+            'test_unseen': dataloaders_test['test_unseen'],
+            'test_generalized': dataloaders_test['test_generalized']
+        }
+        print(f"[DataLoader] Testing uses {test_k_shot}-shot dataloaders")
+    else:
+        # If test and training use same k_shot, use train dataloaders directly
+        test_loaders = {
+            'test_seen': dataloaders_train['test_seen'],
+            'test_unseen': dataloaders_train['test_unseen'],
+            'test_generalized': dataloaders_train['test_generalized']
+        }
+        print(f"[DataLoader] Testing uses same {CFG.k_shot}-shot dataloaders as training")
+    
+    print(f"\n[DataLoader] Created dataloaders:")
+    print(f"  Train: {CFG.k_shot}-shot, {CFG.train_episodes_per_epoch} episodes/epoch")
+    print(f"  Val:   {val_k_shot}-shot, {CFG.val_episodes_per_epoch} episodes/epoch")
+    print(f"  Test:  {test_k_shot}-shot, {CFG.test_episodes_per_epoch} episodes/split")
 
     # Initialize model
     model = MalwareHead(CFG.input_dim, hidden=512, n_way=CFG.n_way).to(CFG.device)
 
-    # Training loop
+    # Training loop with early stopping and learning rate decay
     best_val = -1.0
     save_path = os.path.join(CFG.log_dir, f"mi_maml_{timestamp()}.pth")
+    
+    # Early stopping and learning rate scheduling variables
+    patience_counter = 0
+    lr_patience_counter = 0
+    best_epoch = 0
+    
+    # Get optimizer (created in run_epoch, need to initialize here)
+    _ = run_epoch(train=True, model=model, loader=train_loader, cfg=CFG)
+    meta_opt = run_epoch._opt
+    current_lr = CFG.meta_lr
 
     for epoch in range(1, CFG.max_epoch + 1):
         print(f"\n===== Epoch {epoch}/{CFG.max_epoch} =====")
+        print(f"Current learning rate: {current_lr:.6f}")
         
         train_stats = run_epoch(train=True, model=model, loader=train_loader,
                                cfg=CFG)
         val_stats = run_epoch(train=False, model=model, loader=val_loader,
-                             cfg=CFG)
+                             cfg=CFG, test_k_shot=val_k_shot)  # Use val_k_shot for validation
 
         print(
             f"Train: acc={train_stats['acc']*100:.2f}%  "
@@ -751,9 +766,15 @@ def main() -> None:
         # Log epoch statistics
         logger.add(epoch, train_stats, val_stats)
 
-        # Save best model
+        # Check if validation improved
+        improved = False
         if val_stats["acc"] > best_val:
             best_val = val_stats["acc"]
+            best_epoch = epoch
+            patience_counter = 0
+            lr_patience_counter = 0
+            improved = True
+            
             cfg_dict = {
                 k: v for k, v in CFG.__dict__.items()
                 if not k.startswith("__") and isinstance(
@@ -769,12 +790,77 @@ def main() -> None:
             }, save_path)
             
             print(
-                f" Saved best model: {save_path} "
-                f"(val_acc={best_val*100:.2f}%)"
+                f"✓ Saved best model (epoch {epoch}, val_acc={best_val*100:.2f}%)"
             )
+        else:
+            patience_counter += 1
+            lr_patience_counter += 1
+            print(f"  No improvement ({patience_counter}/{CFG.early_stopping_patience})")
+        
+        # Learning rate decay
+        if lr_patience_counter >= CFG.lr_decay_patience:
+            current_lr = max(current_lr * CFG.lr_decay_factor, CFG.min_lr)
+            for param_group in meta_opt.param_groups:
+                param_group['lr'] = current_lr
+            lr_patience_counter = 0
+            print(f"  ⚠ Learning rate decayed to: {current_lr:.6f}")
+        
+        # Early stopping
+        if patience_counter >= CFG.early_stopping_patience:
+            print(f"\n⚠ Early stopping triggered! No improvement for {CFG.early_stopping_patience} epochs.")
+            print(f"Best validation accuracy: {best_val*100:.2f}% at epoch {best_epoch}")
+            break
 
     print(f"\n Training done. Logs saved at: {logger.path}")
     print(f" Best model saved at: {save_path}")
+    
+    # ============================================================================
+    # Testing phase: Evaluate on best model
+    # ============================================================================
+    print("\n" + "=" * 60)
+    print("Starting Testing Phase")
+    print("=" * 60)
+    
+    # Load best model
+    print(f"\n[Test] Loading best model: {save_path}")
+    checkpoint = torch.load(save_path, map_location=CFG.device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    
+    # Test on three test sets
+    test_results = {}
+    for test_name, test_loader in test_loaders.items():
+        print(f"\n[Test] Testing {test_name}...")
+        test_stats = run_epoch(
+            train=False,
+            model=model,
+            loader=test_loader,
+            cfg=CFG,
+            test_k_shot=test_k_shot  # Use test_k_shot for testing
+        )
+        test_results[test_name] = test_stats
+        
+        print(
+            f"{test_name}: acc={test_stats['acc']*100:.2f}%  "
+            f"loss={test_stats['loss']:.4f}"
+        )
+    
+    # Save test results to log
+    logger.logs["test_results"] = test_results
+    logger.logs["test_config"] = {
+        "test_k_shot": test_k_shot,
+        "test_episodes_per_epoch": CFG.test_episodes_per_epoch
+    }
+    with open(logger.path, "w") as f:
+        json.dump(logger.logs, f, indent=2)
+    
+    print("\n" + "=" * 60)
+    print("Testing Complete!")
+    print("=" * 60)
+    print("\nTest Results Summary:")
+    for test_name, stats in test_results.items():
+        print(f"  {test_name}: {stats['acc']*100:.2f}%")
+    print(f"\nAll results saved to: {logger.path}")
 
 
 if __name__ == "__main__":
