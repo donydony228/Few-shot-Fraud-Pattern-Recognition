@@ -709,7 +709,6 @@ def main() -> None:
             seed=CFG.seed
         )
         test_loaders = {
-            'test_seen': dataloaders_test['test_seen'],
             'test_unseen': dataloaders_test['test_unseen'],
             'test_generalized': dataloaders_test['test_generalized']
         }
@@ -717,7 +716,6 @@ def main() -> None:
     else:
         # If test and training use same k_shot, use train dataloaders directly
         test_loaders = {
-            'test_seen': dataloaders_train['test_seen'],
             'test_unseen': dataloaders_train['test_unseen'],
             'test_generalized': dataloaders_train['test_generalized']
         }

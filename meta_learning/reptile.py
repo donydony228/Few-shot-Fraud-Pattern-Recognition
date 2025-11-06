@@ -273,7 +273,6 @@ def main():
 
     train_loader = pick_loader(dataloaders, ["train"], "train")
     val_loader = pick_loader(dataloaders, ["val"], "val")
-    test_seen = pick_loader(dataloaders, ["test_seen"], "test_seen")
     test_unseen = pick_loader(dataloaders, ["test_unseen"], "test_unseen")
     test_general = pick_loader(dataloaders, ["test_generalized"], "test_generalized")
 
@@ -331,12 +330,10 @@ def main():
         return m
 
     print("\n=== Final Evaluation ===")
-    seen_m = evaluate("test_seen", test_seen)
     unseen_m = evaluate("test_unseen", test_unseen)
     general_m = evaluate("test_generalized", test_general)
 
     print("\n====== Test Summary ======")
-    print(f"Seen:        {seen_m['acc']*100:.2f}%")
     print(f"Unseen:      {unseen_m['acc']*100:.2f}%")
     print(f"Generalized: {general_m['acc']*100:.2f}%")
     print("==========================")
