@@ -1,6 +1,5 @@
 # python -m meta_learning.MAML
 import os
-print("Test")
 import sys
 import random
 import json
@@ -32,7 +31,7 @@ src_path = os.path.join(os.path.dirname(current_dir), 'src')
 sys.path.append(src_path)
 
 try:
-    from extraction.data_loader import create_dataloaders
+    from extraction.data_loader import create_meta_learning_dataloaders, split_episode_to_support_query
     from extraction.downloader import download_dataset
 except ImportError as e:
     print(f"Import error: {e}")
@@ -48,7 +47,7 @@ except ImportError as e:
         try:
             if alt_path not in sys.path:
                 sys.path.append(alt_path)
-            from extraction.data_loader import create_dataloaders
+            from extraction.data_loader import create_meta_learning_dataloaders, split_episode_to_support_query
             from extraction.downloader import download_dataset
             print(f"Successfully imported from path: {alt_path}")
             imported = True
@@ -68,13 +67,13 @@ class CFG:
     q_query = 15
     input_dim = 1280
 
-    inner_lr = 0.01  
-    meta_lr = 0.001
-    inner_steps_train = 1  
-    inner_steps_val = 1
+    inner_lr = 0.005 
+    meta_lr = 0.0005
+    inner_steps_train = 5  
+    inner_steps_val = 5
 
     meta_batch_size = 16  
-    max_epoch = 100  
+    max_epoch = 200  
     eval_batches = 20
     grad_clip = 10.0
 
@@ -111,8 +110,7 @@ def calculate_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     """Calculate classification accuracy."""
     return (torch.argmax(logits, -1).cpu().numpy() == labels.cpu().numpy()).mean()
 
-def calculate_metrics(preds: List[int], labels: List[int],
-                     num_classes: int) -> Dict[str, Any]:
+def calculate_metrics(preds: List[int], labels: List[int], num_classes: int) -> Dict[str, Any]:
     """Calculate comprehensive classification metrics."""
     preds = np.array(preds)
     labels = np.array(labels)
@@ -171,111 +169,11 @@ class Logger:
             return True
         return False
 
-# DATASET WRAPPER - Using standardized dataloader
-class MAMLDatasetWrapper(Dataset):
-    """Wrapper to adapt the standardized dataset for MAML's episodic training."""
-    
-    def __init__(self, dataloader, n_way=3, k_shot=1, q_query=5, num_tasks=1000):
-        """Initialize MAML dataset wrapper."""
-        self.dataloader = dataloader
-        self.n_way = n_way
-        self.k_shot = k_shot
-        self.q_query = q_query
-        self.num_tasks = num_tasks
-        
-        # Extract all data and organize by class
-        self.class_data = self._organize_data_by_class()
-        self.available_classes = list(self.class_data.keys())
-        
-        print(f"Available classes: {len(self.available_classes)}")
-        print(f"Class distribution: {[(cls, len(samples)) for cls, samples in self.class_data.items()]}")
-        
-        # Check if we have enough classes
-        if len(self.available_classes) < self.n_way:
-            raise ValueError(f"Need at least {self.n_way} classes for {self.n_way}-way classification, but only found {len(self.available_classes)}")
-        
-        # Validate we have enough samples per class
-        min_samples_needed = self.k_shot + self.q_query
-        for cls, samples in self.class_data.items():
-            if len(samples) < min_samples_needed:
-                print(f"Warning: Class {cls} has only {len(samples)} samples, need {min_samples_needed}. Will use replacement sampling.")
-    
-    def _organize_data_by_class(self):
-        """Organize dataset samples by class label"""
-        class_data = {}
-        
-        for features, label in self.dataloader:
-            label_item = label.item()
-            if label_item not in class_data:
-                class_data[label_item] = []
-            class_data[label_item].append(features.squeeze(0))
-        
-        return class_data
-    
-    def _sample_task_classes(self):
-        """Sample classes for an n-way task"""
-        # Randomly sample n_way classes from available classes
-        sampled_classes = np.random.choice(self.available_classes, self.n_way, replace=False)
-        return list(sampled_classes)
-    
-    def __len__(self):
-        return self.num_tasks
-    
-    def __getitem__(self, idx):
-        """Generate a single N-way K-shot task"""
-        # Set seed for reproducibility based on index
-        np.random.seed(CFG.random_seed + idx)
-        
-        # Sample classes for this task
-        task_classes = self._sample_task_classes()
-        
-        task_data = []
-        
-        for cls in task_classes:
-            class_samples = self.class_data[cls]
-            
-            # Sample support + query samples
-            total_needed = self.k_shot + self.q_query
-            
-            if len(class_samples) >= total_needed:
-                selected_indices = np.random.choice(len(class_samples), total_needed, replace=False)
-            else:
-                # Sample with replacement if not enough samples
-                selected_indices = np.random.choice(len(class_samples), total_needed, replace=True)
-            
-            selected_samples = [class_samples[i] for i in selected_indices]
-            task_data.append(torch.stack(selected_samples))
-        
-        # Stack all class data: [n_way, k_shot + q_query, feature_dim]
-        task_tensor = torch.stack(task_data)
-        
-        # Reshape to [n_way * (k_shot + q_query), feature_dim]
-        task_tensor = task_tensor.view(-1, task_tensor.size(-1))
-        
-        return task_tensor
-
-def get_meta_batch(meta_batch_size, k_shot, q_query, data_loader, iterator):
-    """Get meta batch function adapted for standardized dataloader"""
-    data = []
-    for _ in range(meta_batch_size):
-        try:
-            task_data = next(iterator)
-        except StopIteration:
-            iterator = iter(data_loader)
-            task_data = next(iterator)
-        
-        # task_data shape: [1, n_way * (k_shot + q_query), feature_dim]
-        # Remove the batch dimension
-        task_data = task_data.squeeze(0)  # [n_way * (k_shot + q_query), feature_dim]
-        data.append(task_data)
-    
-    return torch.stack(data).to(CFG.device), iterator
-
 # MODEL
 class MalwareClassifier(nn.Module):
     """Neural network for malware classification with functional forward pass for MAML."""
     
-    def __init__(self, input_dim, hidden_dim=64, output_dim=3):
+    def __init__(self, input_dim, hidden_dim=128, output_dim=3):
         """Initialize malware classifier."""
         super(MalwareClassifier, self).__init__()
         
@@ -348,85 +246,112 @@ class EarlyStopping:
             self.counter += 1
             return self.counter >= self.patience
 
-
 # MAML ALGORITHM
 def maml_step_with_preds(model: nn.Module,
                          criterion: nn.Module,
-                         task_batch_normalized: torch.Tensor,
+                         episode_data: torch.Tensor,
                          train: bool
                          ) -> Tuple[torch.Tensor, float, torch.Tensor, torch.Tensor]:
-    """
-    Perform a single MAML step (inner and outer loop) for one task.
-    """
+    """MAML step with predictions."""
     
-    # task_batch_normalized Shape: [1, N*(K+Q), D]
-    task_tensor = task_batch_normalized.squeeze(0) # Shape: [N*(K+Q), D]
+    # Deal with episode_data format
+    if isinstance(episode_data, (list, tuple)) and len(episode_data) >= 1:
+        episode_tensor = episode_data[0]
+    else:
+        episode_tensor = episode_data
+    
+    episode = episode_tensor.squeeze(0)
+    
+    # Check episode shape
+    if episode.dim() != 3:  # Expect [n_way, k_shot+q_query, feature_dim]
+        print(f"Warning: Unexpected episode shape {episode.shape}, attempting to reshape...")
+        # Attempt reshape
+        total_samples = CFG.n_way * (CFG.k_shot + CFG.q_query)
+        if episode.numel() // CFG.input_dim == total_samples:
+            episode = episode.view(CFG.n_way, CFG.k_shot + CFG.q_query, CFG.input_dim)
+        else:
+            raise ValueError(f"Cannot reshape episode {episode.shape} to expected format")
+    
+    # Split support and query sets
+    support_x, query_x, support_y, query_y = split_episode_to_support_query(
+        episode, k_shot=CFG.k_shot, q_query=CFG.q_query
+    )
 
-    support_indices = []
-    query_indices = []
-    for n in range(CFG.n_way):
-        class_start_idx = n * (CFG.k_shot + CFG.q_query)
-        # K-shot support
-        support_indices.extend(range(class_start_idx, class_start_idx + CFG.k_shot))
-        # Q-query query
-        query_indices.extend(range(class_start_idx + CFG.k_shot, class_start_idx + CFG.k_shot + CFG.q_query))
+    # Move to device
+    support_x = support_x.to(CFG.device)
+    query_x = query_x.to(CFG.device)
+    support_y = support_y.to(CFG.device)
+    query_y = query_y.to(CFG.device)
     
-    support_x = task_tensor[support_indices] # [N*K, D]
-    query_x = task_tensor[query_indices]     # [N*Q, D]
+    # Check NaN/Inf in support/query data
+    if torch.isnan(support_x).any() or torch.isnan(query_x).any():
+        raise ValueError("NaN detected in support/query data")
+    
+    # Initialize fast weights
+    fast_weights = OrderedDict()
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            fast_weights[name] = param.clone()
 
-    # Create labels
-    support_y = torch.arange(CFG.n_way).repeat_interleave(CFG.k_shot).to(CFG.device) # [N*K]
-    query_y = torch.arange(CFG.n_way).repeat_interleave(CFG.q_query).to(CFG.device)   # [N*Q]
-    
-    # Initialize fast weights (θ') for inner loop
-    fast_weights = OrderedDict(model.named_parameters())
     inner_steps = CFG.inner_steps_train if train else CFG.inner_steps_val
     
+    # Inner loop
     for inner_step in range(inner_steps):
-        # Calculate support logits and loss with current fast weights
         support_logits = model.functional_forward(support_x, fast_weights)
         support_loss = criterion(support_logits, support_y)
         
-        # Calculate gradients w.r.t. fast weights
-        grads = torch.autograd.grad(support_loss, 
-                                    fast_weights.values(), 
-                                    create_graph=False) # <--- FO-MAML
+        # Check support loss
+        if torch.isnan(support_loss) or torch.isinf(support_loss):
+            raise ValueError(f"Invalid support loss at inner step {inner_step}")
+        
+        grads = torch.autograd.grad(support_loss, fast_weights.values(), create_graph=False)
 
-        # Update fast weights (θ')
+        # Check gradient validity
+        for grad in grads:
+            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                raise ValueError(f"Invalid gradient at inner step {inner_step}")
+        
+        # Update fast weights
         fast_weights = OrderedDict(
             (name, param - CFG.inner_lr * grad)
             for ((name, param), grad) in zip(fast_weights.items(), grads)
         )
 
-    # Calculate query logits and loss with adapted fast weights
+    # Query forward
     query_logits = model.functional_forward(query_x, fast_weights)
     query_loss = criterion(query_logits, query_y)
-    meta_loss = query_loss 
-    
-    # Calculate task accuracy
+
+    # Check query loss
+    if torch.isnan(query_loss) or torch.isinf(query_loss):
+        raise ValueError("Invalid query loss")
+
+    # Calculate accuracy
     with torch.no_grad():
         preds = torch.argmax(query_logits, dim=1)
-        labels = query_y
-        task_acc = (preds == labels).sum().item() / len(labels)
+        task_acc = (preds == query_y).sum().item() / len(query_y)
 
-    # FO-MAML Outer Loop Update
+    # FO-MAML outer loop
     if train:
-        # Calculate meta gradients w.r.t. original model parameters (θ)
-        meta_grads = torch.autograd.grad(meta_loss, 
-                                         fast_weights.values())
+        # Compute meta-gradients w.r.t original model parameters
+        meta_grads = torch.autograd.grad(
+            query_loss, 
+            model.parameters(),
+            create_graph=False
+        )
 
-        # Get original model parameters (θ)
-        params = model.parameters()
+        # Check meta gradients
+        for grad in meta_grads:
+            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                raise ValueError("Invalid meta gradient")
 
-        # Accumulate gradients into model parameters (θ)
-        for param, meta_grad in zip(params, meta_grads):
+        # Accumulate gradients
+        for param, meta_grad in zip(model.parameters(), meta_grads):
             if param.grad is None:
                 param.grad = meta_grad.detach()
             else:
-                # Accumulate gradients
                 param.grad += meta_grad.detach()
 
-    return meta_loss, task_acc, preds.detach().cpu(), labels.detach().cpu()
+    return query_loss, task_acc, preds.detach().cpu(), query_y.detach().cpu()
 
 def get_task_predictions(model, task_tensor, loss_fn, cfg, inner_steps):
     """
@@ -491,7 +416,7 @@ def run_epoch(
     train: bool = True
 ) -> Dict[str, Any]:
     """
-    Run a single epoch of MAML training or evaluation.
+    Run a single epoch of training or validation.
     """
     
     if train:
@@ -500,86 +425,37 @@ def run_epoch(
     epoch_meta_loss = 0.0
     all_preds = []
     all_labels = []
+    sample_episode = next(iter(dataloader))
     
-    try:
-        diag_batch = next(iter(dataloader))
-        # print(f"  Type of diag_batch: {type(diag_batch)}")
-        
-        support_x = None
-        
-        if isinstance(diag_batch, (list, tuple)):
-            # print(f"  Length of batch: {len(diag_batch)}")
-            if len(diag_batch) == 5:
-                support_x = diag_batch[0].to(CFG.device)
-            elif len(diag_batch) > 0:
-                support_x = diag_batch[0].to(CFG.device)
-            else:
-                print("Error: Batch is empty.")
-        else:
-            # print("  Batch is not a list/tuple. Assuming it's the tensor itself.")
-            support_x = diag_batch.to(CFG.device)
-
-    except Exception as e:
-        print(f"Error: Data diagnostics failed: {e}")
-    print("="*30 + "\n")
-
-    # Iterate tqdm for progress bar
+    # Set up progress bar
     epoch_iterator = tqdm(dataloader, desc=f"Epoch {epoch+1}/{CFG.max_epoch} [{mode}]", leave=False)
     
-    for i, task_batch in enumerate(epoch_iterator):
-        # Set task batch to device
-        task_batch = task_batch.to(CFG.device) # Shape [1, N*(K+Q), D]
+    for i, episode_data in enumerate(epoch_iterator):
         
-        # Check for NaN/Inf in raw task batch before normalization
-        if torch.isnan(task_batch).any() or torch.isinf(task_batch).any():
-            if hasattr(CFG, 'verbose') and CFG.verbose:
-                print(f"\nWarning: Skipping task {i} due to NaN/Inf in raw data.")
+        # Deal with episode_data format
+        if isinstance(episode_data, (list, tuple)) and len(episode_data) >= 1:
+            episode_tensor = episode_data[0]
+        else:
+            episode_tensor = episode_data
+        
+        # Check NaN/Inf in episode data
+        if torch.isnan(episode_tensor).any() or torch.isinf(episode_tensor).any():
+            print(f"\nWarning: Skipping task {i} due to NaN/Inf in episode data.")
             continue
-
-        # Squeeze to [N*(K+Q), D] for normalization
-        task_tensor_raw = task_batch.squeeze(0)
-
-        # Get Support and Query indices
-        support_indices = []
-        query_indices = []
-        for n in range(CFG.n_way):
-            class_start_idx = n * (CFG.k_shot + CFG.q_query)
-            support_indices.extend(range(class_start_idx, class_start_idx + CFG.k_shot))
-            query_indices.extend(range(class_start_idx + CFG.k_shot, class_start_idx + CFG.k_shot + CFG.q_query))
-
-        support_x_raw = task_tensor_raw[support_indices] # [N*K, D]
-        query_x_raw = task_tensor_raw[query_indices]     # [N*Q, D]
         
-        # Calculate mean and std from Support set
-        mean = torch.mean(support_x_raw, dim=0) # Shape: [D]
-        std = torch.std(support_x_raw, dim=0)   # Shape: [D]
+        # MAML step
+        try:
+            meta_loss, task_acc, preds, labels = maml_step_with_preds(
+                model, criterion, episode_data, train=train  
+            )
+        except Exception as e:
+            print(f"\nError in maml_step at task {i}: {e}")
+            continue
         
-        # Normalize Support and Query sets
-        support_x_norm = (support_x_raw - mean) / (std + CFG.eps)
-        query_x_norm = (query_x_raw - mean) / (std + CFG.eps)
-        
-        # Replace NaN values resulted from zero std with zeros
-        support_x_norm = torch.nan_to_num(support_x_norm, nan=0.0)
-        query_x_norm = torch.nan_to_num(query_x_norm, nan=0.0)
-
-        # Combine back into a single task tensor
-        task_tensor_normalized = torch.zeros_like(task_tensor_raw)
-        
-        # Replace support and query parts with normalized data
-        task_tensor_normalized[support_indices] = support_x_norm
-        task_tensor_normalized[query_indices] = query_x_norm
-        task_batch_normalized = task_tensor_normalized.unsqueeze(0)
-        
-        # Invoke MAML step
-        meta_loss, task_acc, preds, labels = maml_step_with_preds(
-            model, criterion, task_batch_normalized, train=train
-        )
-        
-        # Convert meta_loss to float for accumulation
+        # Check meta loss validity
         meta_loss_float = meta_loss.item()
-
-        if np.isnan(meta_loss_float):
-            print(f"\nWarning: Detected 'nan' loss in epoch {epoch+1} [{mode}] at task {i}. Stopping epoch early.")
+        if np.isnan(meta_loss_float) or np.isinf(meta_loss_float):
+            print(f"\nWarning: Detected invalid loss in epoch {epoch+1} [{mode}] at task {i}. Stopping epoch early.")
             epoch_meta_loss = np.nan
             break 
         
@@ -587,7 +463,21 @@ def run_epoch(
         all_preds.extend(preds)
         all_labels.extend(labels)
 
+        # Check gradient update logic
         if train and (i + 1) % CFG.meta_batch_size == 0:
+            # Check gradient validity
+            total_norm = 0
+            for param in model.parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** (1. / 2)
+            
+            if np.isnan(total_norm) or np.isinf(total_norm):
+                print(f"\nWarning: Invalid gradient norm detected, skipping update")
+                meta_optimizer.zero_grad()
+                continue
+                
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CFG.grad_clip)
             meta_optimizer.step()
             meta_optimizer.zero_grad()
@@ -597,21 +487,13 @@ def run_epoch(
             task_acc=f"{task_acc:.4f}"
         )
 
-    # Deal with remaining gradients if any
-    if train and (i + 1) % CFG.meta_batch_size != 0 and not np.isnan(epoch_meta_loss):
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CFG.grad_clip)
-        meta_optimizer.step()
-        meta_optimizer.zero_grad()
-
-    # Calculate average epoch loss
+    # Calculate average loss
     if np.isnan(epoch_meta_loss):
         avg_epoch_loss = np.nan
     else:
-        avg_epoch_loss = epoch_meta_loss / len(dataloader)
+        avg_epoch_loss = epoch_meta_loss / max(len(dataloader), 1)
     
-    all_labels = np.array(all_labels)
-    all_preds = np.array(all_preds)
-
+    # Handle case with no valid labels/predictions
     if len(all_labels) == 0 or len(all_preds) == 0:
         print(f"Warning: No labels or predictions found for epoch {epoch+1} [{mode}]. Skipping metrics.")
         return {
@@ -624,6 +506,9 @@ def run_epoch(
             "confusion_matrix": None
         }
 
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    
     # Calculate metrics
     avg_accuracy = accuracy_score(all_labels, all_preds)
     f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
@@ -631,10 +516,7 @@ def run_epoch(
     precision_macro = precision_score(all_labels, all_preds, average='macro', zero_division=0)
     recall_macro = recall_score(all_labels, all_preds, average='macro', zero_division=0)
     
-    all_labels_int = all_labels.astype(int)
-    all_preds_int = all_preds.astype(int)
-    
-    cm = confusion_matrix(all_labels_int, all_preds_int)
+    cm = confusion_matrix(all_labels.astype(int), all_preds.astype(int))
 
     return {
         "loss": float(avg_epoch_loss),
@@ -648,7 +530,6 @@ def run_epoch(
 
 def test_model(model, test_loader, num_test_tasks=20):
     """Test the trained model and return detailed results."""
-    test_iter = iter(test_loader)
     
     all_predicted_labels = []
     all_true_labels = []
@@ -657,48 +538,50 @@ def test_model(model, test_loader, num_test_tasks=20):
     print("Starting testing (collecting predictions for detailed report)...")
     device = CFG.device 
 
-    for batch_idx in tqdm(range(num_test_tasks), desc="Testing"):
-        x, test_iter = get_meta_batch(1, CFG.k_shot, CFG.q_query, test_loader, test_iter)
+    # Iterate over test tasks
+    task_count = 0
+    for episode_data in tqdm(test_loader, desc="Testing"):
+        if task_count >= num_test_tasks:
+            break
+
+        # Retrieve episode tensor
+        episode_tensor = episode_data[0] if isinstance(episode_data, (list, tuple)) else episode_data
+        episode = episode_tensor.squeeze(0)  # [n_way, k_shot+q_query, feature_dim]
         
-        # x shape: [1, N*(K+Q), D]
-        task_tensor_raw = x[0] # [N*(K+Q), D]
-   
-        task_tensor_raw = task_tensor_raw.to(device)
+        support_x, query_x, support_y, query_y = split_episode_to_support_query(
+            episode, CFG.k_shot, CFG.q_query
+        )
         
-        if torch.isnan(task_tensor_raw).any() or torch.isinf(task_tensor_raw).any():
-            if hasattr(CFG, 'verbose') and CFG.verbose:
-                print(f"\nWarning: Skipping test task {batch_idx} due to NaN/Inf in raw data.")
+        support_x, query_x = support_x.to(device), query_x.to(device)
+        
+        # Check NaN/Inf in support/query data
+        if torch.isnan(support_x).any() or torch.isnan(query_x).any():
+            task_count += 1
             continue
+
+        # Normalize (optional, supported by new dataloader)
+        if hasattr(CFG, 'normalize_at_test') and CFG.normalize_at_test:
+            mean = torch.mean(support_x, dim=0)
+            std = torch.std(support_x, dim=0)
             
-        support_indices = []
-        query_indices = []
+            support_x = (support_x - mean) / (std + CFG.eps)
+            query_x = (query_x - mean) / (std + CFG.eps)
+            
+            support_x = torch.nan_to_num(support_x, nan=0.0)
+            query_x = torch.nan_to_num(query_x, nan=0.0)
+        
+        task_tensor = torch.zeros(CFG.n_way * (CFG.k_shot + CFG.q_query), support_x.shape[-1], device=device)
+        
         for n in range(CFG.n_way):
             class_start_idx = n * (CFG.k_shot + CFG.q_query)
-            support_indices.extend(range(class_start_idx, class_start_idx + CFG.k_shot))
-            query_indices.extend(range(class_start_idx + CFG.k_shot, class_start_idx + CFG.k_shot + CFG.q_query))
-        
-        support_x_raw = task_tensor_raw[support_indices]
-        query_x_raw = task_tensor_raw[query_indices]
-
-        mean = torch.mean(support_x_raw, dim=0)
-        std = torch.std(support_x_raw, dim=0)
-
-        support_x_norm = (support_x_raw - mean) / (std + CFG.eps)
-        query_x_norm = (query_x_raw - mean) / (std + CFG.eps)
-        
-        support_x_norm = torch.nan_to_num(support_x_norm, nan=0.0)
-        query_x_norm = torch.nan_to_num(query_x_norm, nan=0.0)
-
-        task_tensor_normalized = torch.zeros_like(task_tensor_raw)
-        task_tensor_normalized[support_indices] = support_x_norm
-        task_tensor_normalized[query_indices] = query_x_norm
+            support_start = n * CFG.k_shot
+            query_start = n * CFG.q_query
+            
+            task_tensor[class_start_idx:class_start_idx + CFG.k_shot] = support_x[support_start:support_start + CFG.k_shot]
+            task_tensor[class_start_idx + CFG.k_shot:class_start_idx + CFG.k_shot + CFG.q_query] = query_x[query_start:query_start + CFG.q_query]
         
         predicted_labels, true_labels = get_task_predictions(
-            model,
-            task_tensor_normalized, 
-            nn.CrossEntropyLoss(),
-            CFG,
-            CFG.inner_steps_val
+            model, task_tensor, nn.CrossEntropyLoss(), CFG, CFG.inner_steps_val
         )
 
         task_true = np.array(true_labels)
@@ -708,12 +591,14 @@ def test_model(model, test_loader, num_test_tasks=20):
 
         all_predicted_labels.extend(predicted_labels)
         all_true_labels.extend(true_labels)
+        
+        task_count += 1
 
     return all_predicted_labels, all_true_labels, task_accuracies
 
 def main():
     """Main training loop for MAML meta-learning."""
-    print(f"🔥 MAML Meta-Learning for Malware Classification (FIXED VERSION)")
+    print(f"MAML Meta-Learning for Malware Classification (FIXED VERSION)")
     print(f"Using device: {CFG.device}")
     
     # Set random seeds
@@ -730,69 +615,38 @@ def main():
     split_csv_path = os.path.join(CFG.dataset_dir, 'label_split.csv')
 
     # Create standardized dataloaders
-    dataloaders = create_dataloaders(
+    dataloaders = create_meta_learning_dataloaders(
         features_dir=features_dir,
         split_csv_path=split_csv_path,
-        batch_size=1,  
-        val_ratio=0.1,
-        test_ratio=0.1,
-        generalized=False,
-        num_workers=0  # Set to 0 for compatibility
+        n_way=CFG.n_way,
+        k_shot=CFG.k_shot,
+        q_query=CFG.q_query,
+        train_episodes_per_epoch=200,   
+        val_episodes_per_epoch=100,     
+        test_episodes_per_epoch=200,    
+        normalize=True,
+        num_workers=0,
+        pin_memory=False,
+        seed=CFG.random_seed
     )
 
-    print(f"Available dataloaders: {list(dataloaders.keys())}")
-    print(f"Train dataset size: {len(dataloaders['train'].dataset)}")
-    print(f"Validation dataset size: {len(dataloaders['val'].dataset)}")
-    print(f"Test unseen dataset size: {len(dataloaders['test_unseen'].dataset)}")
+    # Define dataloaders
+    train_loader = dataloaders['train']
+    val_loader = dataloaders['val'] 
+    test_loader = dataloaders['test_unseen']  # Use unseen test set for final evaluation
 
-    # Check available classes and adjust n_way if needed
-    temp_loader = dataloaders['train']
-    temp_classes = set()
-    sample_count = 0
-    for _, label in temp_loader:
-        temp_classes.add(label.item())
-        sample_count += 1
-        if sample_count >= 100:  # Sample enough to get all classes
-            break
-    actual_num_classes = len(temp_classes)
-    print(f"Actual number of classes found: {actual_num_classes}")
-    print(f"Available classes: {sorted(list(temp_classes))}")
+    # Check episode format and adjust input_dim if necessary
+    sample_episode = next(iter(train_loader))
+    if isinstance(sample_episode, (list, tuple)) and len(sample_episode) >= 1:
+        episode_tensor = sample_episode[0]  # Get episode tensor
+        actual_input_dim = episode_tensor.shape[-1]
+    else:
+        episode_tensor = sample_episode
+        actual_input_dim = episode_tensor.shape[-1]
 
-    # Adjust n_way to fit available classes
-    if actual_num_classes < CFG.n_way:
-        print(f"WARNING: Only {actual_num_classes} classes available, reducing n_way from {CFG.n_way} to {actual_num_classes}")
-        CFG.n_way = actual_num_classes
-    print(f"Using {CFG.n_way}-way classification")
-
-    # Create MAML-compatible datasets from standardized dataloaders
-    train_maml_dataset = MAMLDatasetWrapper(
-        dataloaders['train'], 
-        n_way=CFG.n_way, 
-        k_shot=CFG.k_shot, 
-        q_query=CFG.q_query, 
-        num_tasks=500  # Reduced for faster training
-    )
-
-    val_maml_dataset = MAMLDatasetWrapper(
-        dataloaders['val'], 
-        n_way=CFG.n_way, 
-        k_shot=CFG.k_shot, 
-        q_query=CFG.q_query, 
-        num_tasks=100  # Reduced for faster validation
-    )
-
-    test_maml_dataset = MAMLDatasetWrapper(
-        dataloaders['test_unseen'], 
-        n_way=CFG.n_way, 
-        k_shot=CFG.k_shot, 
-        q_query=CFG.q_query, 
-        num_tasks=200
-    )
-
-    # Create DataLoaders for MAML
-    train_loader = DataLoader(train_maml_dataset, batch_size=1, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_maml_dataset, batch_size=1, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_maml_dataset, batch_size=1, shuffle=False, num_workers=0)
+    # Auto-adjust input_dim
+    if actual_input_dim != CFG.input_dim:
+        CFG.input_dim = actual_input_dim
 
     sample_task = next(iter(train_loader))
     actual_input_dim = sample_task.shape[-1]

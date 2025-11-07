@@ -1,4 +1,4 @@
-# python -m meta_learning.MAML_PLUS_PLUS
+# python -m meta_learning.MAML++
 import os
 import sys
 import random
@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
 
 from sklearn.metrics import (
@@ -26,6 +27,8 @@ from sklearn.metrics import (
     accuracy_score
 )
 
+from dotenv import load_dotenv
+
 # Add src to path to import project modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(os.path.dirname(current_dir), 'src')
@@ -33,22 +36,24 @@ if src_path not in sys.path:
     sys.path.append(src_path)
 
 try:
-    from extraction.data_loader import create_dataloaders
+    from extraction.data_loader import create_meta_learning_dataloaders, split_episode_to_support_query
+    from extraction.downloader import download_dataset
 except ImportError as e:
     print(f"Import error: {e}")
-    print("Please ensure 'src' directory is in the parent folder or PYTHONPATH")
     # Alternative import paths
     alternative_paths = [
         os.path.join(current_dir, '..', 'src'),
         os.path.join(current_dir, 'src'),
+        'src'
     ]
     
     imported = False
     for alt_path in alternative_paths:
-        if alt_path not in sys.path:
-            sys.path.append(alt_path)
         try:
-            from extraction.data_loader import create_dataloaders
+            if alt_path not in sys.path:
+                sys.path.append(alt_path)
+            from extraction.data_loader import create_meta_learning_dataloaders, split_episode_to_support_query
+            from extraction.downloader import download_dataset
             print(f"Successfully imported from path: {alt_path}")
             imported = True
             break
@@ -56,31 +61,31 @@ except ImportError as e:
             continue
     
     if not imported:
-        print("Unable to import create_dataloaders. Please check project structure.")
+        print("Unable to import required modules, please check project structure")
         sys.exit(1)
 
 
 # CONFIGURATION
 class CFG:
     """Configuration parameters for MAML++ meta-learning."""
-    # Task definition
+    # Task definition - 固定1-shot設置
     n_way = 3
-    k_shot = 1
-    q_query = 5
+    k_shot = 1  # 固定1-shot
+    q_query = 15  # 減少query數量以平衡訓練速度
     input_dim = 1280
 
-    # MAML++ Hyperparameters
-    train_inner_train_step = 3
-    val_inner_train_step = 3
-    inner_lr = 0.01  # Base inner LR (MAML++ learns this)
-    meta_lr = 0.001
-    meta_batch_size = 8
-    max_epoch = 20
-    eval_batches = 10
+    # MAML++ Hyperparameters - 優化for 200 epochs
+    train_inner_train_step = 5  # 增加內部步驟，1-shot需要更多適應
+    val_inner_train_step = 5    # 測試時也用更多步驟
+    inner_lr = 0.01             # 保持合理的內部學習率
+    meta_lr = 0.0003            # 降低meta學習率for更長訓練
+    meta_batch_size = 16        # 減小batch size提高穩定性
+    max_epoch = 200             # 增加到200 epochs
+    eval_batches = 20
 
-    # MAML++ specific hyperparameters
-    use_first_order_epochs = max_epoch // 2  # First 15 epochs use first-order (DA)
-    step_weights_initial = [1.0] * (train_inner_train_step + 1)  # For (MSL)
+    # MAML++ specific hyperparameters - 調整for長期訓練
+    use_first_order_epochs = 60  # 前60epochs用一階，後140epochs用二階
+    step_weights_initial = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1]  # 多步驟權重
 
     # Device
     if torch.cuda.is_available():
@@ -156,91 +161,7 @@ class Logger:
             return True
         return False
 
-# DATALOADER (from MAML.py)
-class MAMLDatasetWrapper(Dataset):
-    """Wrapper to adapt the standardized dataset for MAML's episodic training. (from MAML.py)"""
-    
-    def __init__(self, dataloader, n_way, k_shot, q_query, num_tasks):
-        """Initialize MAML dataset wrapper."""
-        self.dataloader = dataloader
-        self.n_way = n_way
-        self.k_shot = k_shot
-        self.q_query = q_query
-        self.num_tasks = num_tasks
-        
-        # Extract all data and organize by class
-        self.class_data = self._organize_data_by_class()
-        self.available_classes = list(self.class_data.keys())
-        
-        print(f"Available classes: {len(self.available_classes)}")
-        print(f"Class distribution: {[(cls, len(samples)) for cls, samples in self.class_data.items()]}")
-        
-        # Check if we have enough classes
-        if len(self.available_classes) < self.n_way:
-            raise ValueError(f"Need at least {self.n_way} classes for {self.n_way}-way classification, but only found {len(self.available_classes)}")
-        
-        # Validate we have enough samples per class
-        min_samples_needed = self.k_shot + self.q_query
-        for cls, samples in self.class_data.items():
-            if len(samples) < min_samples_needed:
-                print(f"Warning: Class {cls} has only {len(samples)} samples, need {min_samples_needed}. Will use replacement sampling.")
-    
-    def _organize_data_by_class(self):
-        """Organize dataset samples by class label"""
-        class_data = {}
-        
-        # Assuming dataloader has batch_size=1 and yields (features, label)
-        for features, label in self.dataloader:
-            label_item = label.item()
-            if label_item not in class_data:
-                class_data[label_item] = []
-            class_data[label_item].append(features.squeeze(0))
-        
-        return class_data
-    
-    def _sample_task_classes(self):
-        """Sample classes for an n-way task"""
-        # Randomly sample n_way classes from available classes
-        sampled_classes = np.random.choice(self.available_classes, self.n_way, replace=False)
-        return list(sampled_classes)
-    
-    def __len__(self):
-        return self.num_tasks
-    
-    def __getitem__(self, idx):
-        """Generate a single N-way K-shot task"""
-        # Set seed for reproducibility based on index
-        np.random.seed(CFG.random_seed + idx)
-        
-        # Sample classes for this task
-        task_classes = self._sample_task_classes()
-        
-        task_data = []
-        
-        for cls in task_classes:
-            class_samples = self.class_data[cls]
-            
-            # Sample support + query samples
-            total_needed = self.k_shot + self.q_query
-            
-            if len(class_samples) >= total_needed:
-                selected_indices = np.random.choice(len(class_samples), total_needed, replace=False)
-            else:
-                # Sample with replacement if not enough samples
-                selected_indices = np.random.choice(len(class_samples), total_needed, replace=True)
-            
-            selected_samples = [class_samples[i] for i in selected_indices]
-            task_data.append(torch.stack(selected_samples))
-        
-        # Stack all class data: [n_way, k_shot + q_query, feature_dim]
-        task_tensor = torch.stack(task_data)
-        
-        # Reshape to [n_way * (k_shot + q_query), feature_dim]
-        task_tensor = task_tensor.view(-1, CFG.input_dim)
-        
-        return task_tensor
-
-# MAML++ MODEL DEFINITION 
+# MAML++ Per-Step BatchNorm
 class PerStepBatchNorm1d(nn.Module):
     """MAML++ Improvement: Per-Step Batch Normalization (BNRS + BNWB)"""
     
@@ -283,10 +204,11 @@ class PerStepBatchNorm1d(nn.Module):
         x_norm = (x - mean) / torch.sqrt(var + self.eps)
         return self.weight[step] * x_norm + self.bias[step]
 
+# MODEL (MAML++ with all improvements)
 class MalwarePlusPlusClassifier(nn.Module):
     """MAML++ Enhanced Classifier with multiple improvements"""
     
-    def __init__(self, input_dim, hidden_dim=256, output_dim=3, num_inner_steps=5):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=3, num_inner_steps=3):
         super(MalwarePlusPlusClassifier, self).__init__()
         self.num_inner_steps = num_inner_steps
         
@@ -306,13 +228,13 @@ class MalwarePlusPlusClassifier(nn.Module):
         self.layer_lrs = nn.ParameterDict({
             # FC layers use relatively larger learning rates
             'fc1': nn.Parameter(torch.tensor([0.01, 0.008, 0.006, 0.004, 0.002][:num_inner_steps])),
-            'fc2': nn.Parameter(torch.tensor([0.005, 0.004, 0.003, 0.002, 0.001][:num_inner_steps])),
-            'fc3': nn.Parameter(torch.tensor([0.003, 0.002, 0.002, 0.001, 0.001][:num_inner_steps])),
-            'fc4': nn.Parameter(torch.tensor([0.008, 0.006, 0.004, 0.003, 0.002][:num_inner_steps])),  
+            'fc2': nn.Parameter(torch.tensor([0.008, 0.006, 0.005, 0.003, 0.002][:num_inner_steps])),
+            'fc3': nn.Parameter(torch.tensor([0.006, 0.004, 0.003, 0.002, 0.001][:num_inner_steps])),
+            'fc4': nn.Parameter(torch.tensor([0.01, 0.008, 0.006, 0.004, 0.002][:num_inner_steps])),  
             # BN layers use smaller learning rates
-            'bn1': nn.Parameter(torch.tensor([0.001, 0.0008, 0.0006, 0.0004, 0.0002][:num_inner_steps])),
-            'bn2': nn.Parameter(torch.tensor([0.001, 0.0008, 0.0006, 0.0004, 0.0002][:num_inner_steps])),
-            'bn3': nn.Parameter(torch.tensor([0.001, 0.0008, 0.0006, 0.0004, 0.0002][:num_inner_steps]))
+            'bn1': nn.Parameter(torch.tensor([0.002, 0.0015, 0.001, 0.0008, 0.0005][:num_inner_steps])),
+            'bn2': nn.Parameter(torch.tensor([0.002, 0.0015, 0.001, 0.0008, 0.0005][:num_inner_steps])),
+            'bn3': nn.Parameter(torch.tensor([0.002, 0.0015, 0.001, 0.0008, 0.0005][:num_inner_steps]))
         })
         
         # Dropout for regularization
@@ -403,297 +325,267 @@ class MalwarePlusPlusClassifier(nn.Module):
                     params.get('fc4.bias', self.fc4.bias))
         return x
 
-
 # UTILITY FUNCTIONS
 def create_label(n_way, k_shot):
     """Create labels for support set and query set."""
     return torch.arange(n_way).repeat_interleave(k_shot).long()
 
-def calculate_accuracy(logits, labels):
-    """utility function for accuracy calculation"""
-    acc = np.asarray(
-        [(torch.argmax(logits, -1).cpu().numpy() == labels.cpu().numpy())]
-    ).mean()
-    return acc
-
-class CosineAnnealingLR:
-    """MAML++ Improvement: Cosine Annealing for Meta-Optimizer (CA)"""
-    
-    def __init__(self, optimizer, T_max, eta_min=0, last_epoch=-1):
-        self.optimizer = optimizer
-        self.T_max = T_max
-        self.eta_min = eta_min
-        self.last_epoch = last_epoch
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+class EarlyStopping:
+    """Early stopping utility to halt training when validation accuracy plateaus."""
+    def __init__(self, patience=10, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_val_acc = 0
         
-    def step(self, epoch=None):
-        if epoch is None:
-            epoch = self.last_epoch + 1
-        self.last_epoch = epoch
-        
-        for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            param_group['lr'] = self.eta_min + (base_lr - self.eta_min) * \
-                               (1 + math.cos(math.pi * epoch / self.T_max)) / 2
-        return [group['lr'] for group in self.optimizer.param_groups]
+    def __call__(self, val_acc):
+        if val_acc > self.best_val_acc + self.min_delta:
+            self.best_val_acc = val_acc
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
 
-
-# MAML++ CORE SOLVER (MODIFIED)
+# MAML++ SOLVER (MAIN FUNCTION)
 def MAMLPlusPlusSolver(
     model,
     optimizer,
-    x,
+    episode_data,  # 🔥 改變參數名
     n_way,
     k_shot,
     q_query,
     loss_fn,
-    inner_train_step=5,
+    inner_train_step=1,
     train=True,
     epoch=0,
     step_weights=None,
     use_first_order_epochs=15,
     return_labels=False
 ):
-    """MAML++ Core Algorithm Solver"""
+    """
+    MAML++ solver adapted for new meta-learning dataloader.
     
-    task_loss = []
-    task_acc = []
+    Key MAML++ improvements implemented:
+    1. Per-parameter learning rates (PU) - now layer-wise (LSLR)
+    2. Multi-step loss optimization (MSL)  
+    3. Derivative-order annealing (DA)
+    4. Per-step batch normalization (BNRS + BNWB)
+    """
     
-    if return_labels:
-        all_predicted_labels = []
-        all_true_labels = []
-        task_accuracies = []
+    # 🔥 處理新版dataloader格式
+    if isinstance(episode_data, (list, tuple)) and len(episode_data) >= 1:
+        # episode_data is tuple: (task_tensor, selected_labels, task_labels)
+        episode_tensor = episode_data[0]  # [1, n_way, k_shot+q_query, feature_dim]
+    else:
+        episode_tensor = episode_data
     
-    # MAML++ IMPROVEMENT 4: Derivative-Order Annealing (DA)
-    use_second_order = epoch >= use_first_order_epochs
+    # 移除batch維度: [n_way, k_shot+q_query, feature_dim]
+    episode = episode_tensor.squeeze(0)
     
+    # 🔥 使用新版split函數替代手動處理
+    support_x, query_x, support_y, query_y = split_episode_to_support_query(
+        episode, k_shot=k_shot, q_query=q_query
+    )
+    
+    # 移動到device
+    support_x = support_x.to(CFG.device)
+    query_x = query_x.to(CFG.device)
+    support_y = support_y.to(CFG.device)
+    query_y = query_y.to(CFG.device)
+    
+    # 🔥 檢查數據有效性
+    if torch.isnan(support_x).any() or torch.isnan(query_x).any():
+        raise ValueError("NaN detected in support/query data")
+    
+    # MAML++ IMPROVEMENT: Derivative-order annealing (DA)
+    use_second_order = epoch >= use_first_order_epochs and train
+    
+    # Get initial parameters - 確保參數需要梯度
+    fast_weights = OrderedDict()
+    for name, param in model.named_parameters():
+        # 🔥 修復：驗證時也需要梯度來進行內部適應，只是不更新meta參數
+        if k_shot > 0:  # 只要有support set就需要梯度來做適應
+            fast_weights[name] = param.clone().requires_grad_(True)
+        else:
+            fast_weights[name] = param.clone()
+    
+    # MAML++ IMPROVEMENT: Multi-step loss optimization (MSL)
     if step_weights is None:
         step_weights = [1.0] * (inner_train_step + 1)
     
-    # x is the meta-batch: [meta_batch_size, N*(K+Q), D]
-    for meta_batch in x:
-        # meta_batch is one task: [N*(K+Q), D]
-        
-        # Split support and query sets
-        # Reshape to [N, K+Q, D] to split, then flatten back
-        task_tensor = meta_batch.view(n_way, k_shot + q_query, -1)
-        support_set = task_tensor[:, :k_shot, :].contiguous().view(-1, CFG.input_dim)
-        query_set = task_tensor[:, k_shot:, :].contiguous().view(-1, CFG.input_dim)
-        
-        # Copy the params for inner loop
-        fast_weights = OrderedDict(model.named_parameters())
-        
-        # MAML++ IMPROVEMENT 5: Multi-Step Loss Optimization (MSL)
-        # Store losses from all steps for multi-step optimization
-        step_losses = []
-        
-        ### ---------- INNER TRAIN LOOP ---------- ###
-        for inner_step in range(inner_train_step):
-            train_label = create_label(n_way, k_shot).to(CFG.device)
-            logits = model.functional_forward(support_set, fast_weights, step=inner_step)
-            loss = loss_fn(logits, train_label)
+    task_losses = []
+    
+    # Inner loop adaptation
+    for step in range(inner_train_step):
+        if k_shot > 0:  # 如果有support set
+            # Forward pass on support set with step-aware model
+            support_pred = model.functional_forward(support_x, fast_weights, step=step)
+            support_loss = loss_fn(support_pred, support_y)
             
-            # MSL: Compute query loss for this step
-            if not return_labels:
-                val_label = create_label(n_way, q_query).to(CFG.device)
-                query_logits = model.functional_forward(query_set, fast_weights, step=inner_step)
-                query_loss = loss_fn(query_logits, val_label)
-                step_losses.append(query_loss * step_weights[inner_step])
-
-            # Compute gradients
-            create_graph = use_second_order if train else False
-
-            grads = torch.autograd.grad(loss, fast_weights.values(), 
-                                       create_graph=create_graph,
-                                       retain_graph=True, 
-                                       allow_unused=True)
+            # 🔥 修復：驗證時也需要做參數適應，只是不更新meta參數
+            # 計算梯度（驗證時用一階梯度更快）
+            create_graph = use_second_order and train  # 只有訓練時才用二階
+            grads = torch.autograd.grad(
+                support_loss, 
+                fast_weights.values(),
+                create_graph=create_graph,
+                retain_graph=True,
+                allow_unused=True
+            )
             
-            # Update fast_weights
+            # MAML++ IMPROVEMENT: Layer-wise Step-wise Learning Rates (LSLR)
             new_fast_weights = OrderedDict()
             for (name, param), grad in zip(fast_weights.items(), grads):
                 if grad is None:
                     new_fast_weights[name] = param
                     continue
                 
-                # MAML++ IMPROVEMENT 6: Per-Layer Per-Step Learning Rates (LSLR)
-                layer_name = name.split('.')[0]
-                if layer_name in model.layer_lrs:
-                    lr = model.layer_lrs[layer_name][inner_step]
+                # Get layer name and use layer-specific learning rate
+                layer_name = name.split('.')[0]  # e.g., 'fc1', 'bn1'
+                if layer_name in model.layer_lrs and step < len(model.layer_lrs[layer_name]):
+                    lr = model.layer_lrs[layer_name][step]
                 else:
-                    lr = CFG.inner_lr # Fallback (shouldn't happen)
-                    
+                    lr = CFG.inner_lr  # Fallback
+                
                 new_fast_weights[name] = param - lr * grad
             
             fast_weights = new_fast_weights
         
-        ### ---------- FINAL STEP EVALUATION ---------- ###
-        # MSL: Compute query loss for this step
-        if not return_labels:
-            # Evaluate final step
-            val_label = create_label(n_way, q_query).to(CFG.device)
-            final_logits = model.functional_forward(query_set, fast_weights, step=inner_train_step)
-            final_loss = loss_fn(final_logits, val_label)
-            step_losses.append(final_loss * step_weights[inner_train_step])
-            
-            # MSL: Combine all step losses
-            total_loss = sum(step_losses) / sum(step_weights)
-            task_loss.append(total_loss)
-            task_acc.append(calculate_accuracy(final_logits, val_label))
-            
-        else:
-            # Code path for testing (return_labels=True)
-            val_label = create_label(n_way, q_query).to(CFG.device)
-            final_logits = model.functional_forward(query_set, fast_weights, step=inner_train_step)
-            
-            predicted_labels = torch.argmax(final_logits, -1).cpu().numpy().tolist()
-            task_true_labels = val_label.cpu().numpy().tolist()
-            
-            # Calculate current task accuracy
-            task_true = np.array(task_true_labels)
-            task_pred = np.array(predicted_labels)
-            task_acc = (task_true == task_pred).mean()
-            task_accuracies.append(task_acc)
-
-            # Collect all labels
-            all_predicted_labels.extend(predicted_labels)
-            all_true_labels.extend(task_true_labels)
-
-    if return_labels:
-        return all_predicted_labels, all_true_labels, task_accuracies
+        # Evaluate on query set for this step (always compute this)
+        query_pred = model.functional_forward(query_x, fast_weights, step=step)
+        query_loss = loss_fn(query_pred, query_y)
+        
+        # MAML++ IMPROVEMENT: Multi-step loss optimization (MSL) 
+        weighted_loss = step_weights[step] * query_loss
+        task_losses.append(weighted_loss)
     
-    # Backward pass
-    if train:
-        meta_loss = torch.stack(task_loss).mean()
+    # Final query evaluation (step = inner_train_step)
+    final_query_pred = model.functional_forward(query_x, fast_weights, step=inner_train_step)
+    final_query_loss = loss_fn(final_query_pred, query_y)
+    weighted_final_loss = step_weights[-1] * final_query_loss
+    task_losses.append(weighted_final_loss)
+    
+    # Calculate meta loss (sum of weighted losses)
+    meta_loss = torch.stack(task_losses).sum() / sum(step_weights)
+    
+    # Training mode: update meta parameters
+    if train and optimizer is not None:
         optimizer.zero_grad()
         meta_loss.backward()
-        
-        # Gradient clipping (from MAML.py, good practice)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-        
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
         optimizer.step()
-        return meta_loss, np.mean(task_acc)
     
-    # Evaluation
-    return 0.0, np.mean(task_acc)
+    # 計算準確率用於監控
+    with torch.no_grad():
+        predicted_labels = torch.argmax(final_query_pred, dim=1).cpu().numpy()
+        true_labels = query_y.cpu().numpy()
+        
+    if return_labels:
+        return predicted_labels, true_labels, meta_loss, task_losses
+    else:
+        # 返回meta_loss和準確率用於訓練監控
+        accuracy = (predicted_labels == true_labels).mean()
+        return [meta_loss, accuracy, predicted_labels.tolist(), true_labels.tolist()]
 
 
-# MAML++ TEST FUNCTION
-def test_maml_plus_plus(model, test_loader, num_test_tasks=20):
-    """Test the MAML++ model on unseen tasks"""
-    print("Testing MAML++...")
-    model.eval()
-    
-    loss_fn = nn.CrossEntropyLoss()
-    
-    # Use the test loader
-    test_epoch_iterator = tqdm(test_loader, desc="Testing MAML++", total=num_test_tasks)
+def test_maml_plus_plus(meta_model, test_loader, num_test_tasks=100):
+    """Test MAML++ on unseen classes"""
+    meta_model.eval()
     
     all_predicted_labels = []
     all_true_labels = []
-    all_task_accuracies = []
+    task_accuracies = []
     
-    tasks_run = 0
-    
-    for x in test_epoch_iterator:
-        if tasks_run >= num_test_tasks:
+    # 🔥 修復：MAML測試時也需要梯度來做內部適應
+    for i, episode_data in enumerate(test_loader):
+        if i >= num_test_tasks:
             break
-        
-        x = x.to(CFG.device)
-        
-        # Get predictions and labels
-        predicted_labels, true_labels, task_accuracies = MAMLPlusPlusSolver(
-            model,
-            None,  # No optimizer needed for testing
-            x,
+            
+        # 使用MAMLPlusPlusSolver進行測試
+        predicted_labels, true_labels, _, _ = MAMLPlusPlusSolver(
+            meta_model,
+            None,  # No optimizer for testing
+            episode_data,
             CFG.n_way,
-            CFG.k_shot,
+            CFG.k_shot, 
             CFG.q_query,
-            loss_fn,
-            inner_train_step=CFG.val_inner_train_step, # Use validation steps
+            nn.CrossEntropyLoss(),
+            inner_train_step=CFG.val_inner_train_step,
             train=False,
-            epoch=CFG.max_epoch, # Use 2nd order
             return_labels=True
         )
         
+        # Calculate task accuracy
+        task_acc = (np.array(predicted_labels) == np.array(true_labels)).mean()
+        task_accuracies.append(task_acc)
+        
         all_predicted_labels.extend(predicted_labels)
         all_true_labels.extend(true_labels)
-        all_task_accuracies.extend(task_accuracies) # task_accuracies is a list of batch-size
-        
-        tasks_run += x.size(0) # Add number of tasks in the batch
-        
-    return all_predicted_labels, all_true_labels, all_task_accuracies
-
-# MAIN TRAINING SCRIPT
-def main():
-    """Main training and evaluation script."""
     
-    # --- 1. Setup (Seed and Logger) ---
-    print(f"DEVICE = {CFG.device}")
-    set_random_seeds(CFG.random_seed)
+    return all_predicted_labels, all_true_labels, task_accuracies
+
+
+def main():
+    """Main training function for MAML++."""
+    print("=== MAML++ for Malware Classification ===")
+    print(f"Device: {CFG.device}")
+    
+    # --- 1. Seed and Logger (MAML.py) ---
+    set_random_seeds()
+    
+    # Load environment variables
+    load_dotenv()
     
     logger = Logger()
     print(f"Logging experiment to: {logger.path}")
 
+    # Download dataset if not exists
+    if not os.path.exists(CFG.dataset_dir):
+        download_dataset(dir=CFG.dataset_dir)
+
     # --- 2. Dataloaders (MODIFIED) ---
     print("Creating dataloaders...")
     
-    num_workers = max(os.cpu_count() // 4, 1)
-    dataloaders_dict = create_dataloaders(
-        CFG.features_dir,
-        CFG.split_csv_path,
-        batch_size=1,  # Base dataloader batch size is 1 for episodic sampling
-        num_workers=num_workers
+    dataloaders = create_meta_learning_dataloaders(
+        features_dir=CFG.features_dir,
+        split_csv_path=CFG.split_csv_path,
+        n_way=CFG.n_way,
+        k_shot=CFG.k_shot,
+        q_query=CFG.q_query,
+        train_episodes_per_epoch=200,  # 每個epoch的訓練episodes
+        val_episodes_per_epoch=50,     # 每個epoch的驗證episodes  
+        test_episodes_per_epoch=100,   # 測試episodes
+        normalize=True,
+        num_workers=0,
+        pin_memory=(CFG.device == 'cuda'),
+        seed=CFG.random_seed
     )
     
-    train_dataloader_base = dataloaders_dict['train']
-    val_dataloader_base = dataloaders_dict['val']
-    test_dataloader_base = dataloaders_dict['test_unseen'] 
+    # 🔥 直接獲取DataLoaders，無需wrapper
+    train_loader = dataloaders['train']        # seen classes episodes
+    val_loader = dataloaders['val']            # seen classes episodes
+    test_loader = dataloaders['test_unseen']   # unseen classes episodes
 
-    # Wrap for MAML episodic sampling
-    train_dataset = MAMLDatasetWrapper(
-        train_dataloader_base,
-        n_way=CFG.n_way, k_shot=CFG.k_shot, q_query=CFG.q_query,
-        num_tasks=CFG.meta_batch_size * 200 # ~200 steps per epoch
-    )
-    val_dataset = MAMLDatasetWrapper(
-        val_dataloader_base,
-        n_way=CFG.n_way, k_shot=CFG.k_shot, q_query=CFG.q_query,
-        num_tasks=CFG.meta_batch_size * 50
-    )
-    test_dataset = MAMLDatasetWrapper(
-        test_dataloader_base,
-        n_way=CFG.n_way, k_shot=CFG.k_shot, q_query=CFG.q_query,
-        num_tasks=CFG.meta_batch_size * 50
-    )
+    # Check episode format and adjust input_dim if necessary
+    sample_episode = next(iter(train_loader))
+    if isinstance(sample_episode, (list, tuple)) and len(sample_episode) >= 1:
+        episode_tensor = sample_episode[0]  # Get episode tensor
+        actual_input_dim = episode_tensor.shape[-1]
+    else:
+        episode_tensor = sample_episode
+        actual_input_dim = episode_tensor.shape[-1]
 
-    # Create final DataLoaders
-    pin_mem = (CFG.device == 'cuda')
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=CFG.meta_batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_mem 
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=CFG.meta_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_mem
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=CFG.meta_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_mem
-    )
-    print("Dataloaders created.")
+    # Auto-adjust input_dim
+    if actual_input_dim != CFG.input_dim:
+        print(f"Auto-adjusting input_dim from {CFG.input_dim} to {actual_input_dim}")
+        CFG.input_dim = actual_input_dim
 
     # --- 3. Model, Optimizer, Loss (Unchanged from MAML++) ---
     meta_model = MalwarePlusPlusClassifier(
         input_dim=CFG.input_dim, 
+        hidden_dim=256,  # 使用更大的隱藏維度
         output_dim=CFG.n_way,
         num_inner_steps=CFG.train_inner_train_step
     ).to(CFG.device)
@@ -707,6 +599,11 @@ def main():
     print(f"MAML++ Model parameters: {sum(p.numel() for p in meta_model.parameters())}")
     print(f"Using first-order gradients for first {CFG.use_first_order_epochs} epochs")
     
+    # Early stopping setup (調整for 200 epochs)
+    early_stopping = EarlyStopping(patience=25, min_delta=0.005)  # 增加patience
+    best_val_acc = 0
+    no_improve_epochs = 0
+    
     # --- 4. Training Loop (MODIFIED) ---
     step_weights = CFG.step_weights_initial
     
@@ -719,24 +616,16 @@ def main():
         
         meta_model.train()
         train_meta_loss = []
-        train_acc = []
+        all_train_preds_epoch = []
+        all_train_trues_epoch = []
   
         train_epoch_iterator = tqdm(train_loader, desc=f"Training")
         
-        for x in train_epoch_iterator:
-            # x is a meta-batch: [meta_batch_size, N*(K+Q), D]
-            x = x.to(CFG.device)
-
-            # Check for NaN/Inf (good practice from MAML.py)
-            if torch.isnan(x).any() or torch.isinf(x).any():
-                print("Warning: Skipping meta-batch due to NaN/Inf.")
-                continue
-                
-            # MAMLPlusPlusSolver loops over the meta-batch internally
-            meta_loss, acc = MAMLPlusPlusSolver(
+        for episode_data in train_epoch_iterator:
+            result = MAMLPlusPlusSolver(
                 meta_model,
                 optimizer,
-                x,
+                episode_data,  # 🔥 直接傳遞
                 CFG.n_way,
                 CFG.k_shot,
                 CFG.q_query,
@@ -745,69 +634,147 @@ def main():
                 train=True,
                 epoch=epoch,
                 step_weights=step_weights,
-                use_first_order_epochs=CFG.use_first_order_epochs
+                use_first_order_epochs=CFG.use_first_order_epochs,
+                return_labels=False
             )
             
-            if meta_loss is not None:
-                train_meta_loss.append(meta_loss.item())
-                train_acc.append(acc)
-                train_epoch_iterator.set_postfix({
-                    "loss": f"{meta_loss.item():.3f}", 
-                    "acc": f"{acc*100:.2f}%"
-                })
+            # result = [meta_loss, accuracy, predicted_labels, true_labels]
+            meta_loss, accuracy, predicted_labels, true_labels = result
+            
+            train_meta_loss.append(meta_loss.item())
+            all_train_preds_epoch.extend(predicted_labels)
+            all_train_trues_epoch.extend(true_labels)
+            
+            train_epoch_iterator.set_postfix({
+                "loss": f"{meta_loss.item():.3f}", 
+                "acc": f"{accuracy*100:.2f}%"
+            })
 
         avg_train_loss = np.mean(train_meta_loss)
-        avg_train_acc = np.mean(train_acc)
+        avg_train_acc = accuracy_score(all_train_trues_epoch, all_train_preds_epoch)
+        avg_train_precision = precision_score(all_train_trues_epoch, all_train_preds_epoch, average='macro', zero_division=0)
+        avg_train_recall = recall_score(all_train_trues_epoch, all_train_preds_epoch, average='macro', zero_division=0)
+        avg_train_f1 = f1_score(all_train_trues_epoch, all_train_preds_epoch, average='macro', zero_division=0)
         print(f"Train Loss: {avg_train_loss:.3f}\tAccuracy: {avg_train_acc*100:.3f}%")
+        print(f"Train F1 (Macro): {avg_train_f1:.3f} | Precision: {avg_train_precision:.3f} | Recall: {avg_train_recall:.3f}")
         
         # Validation
         meta_model.eval()
-        val_acc = []
+        
+        #  lists to store all labels from all validation tasks
+        all_val_preds = []
+        all_val_trues = []
+        all_val_loss = []
         
         val_epoch_iterator = tqdm(val_loader, desc="Validation")
         
-        for x in val_epoch_iterator:
-            # x is a meta-batch: [meta_batch_size, N*(K+Q), D]
-            x = x.to(CFG.device)
-            
-            _, acc = MAMLPlusPlusSolver(
+        # 🔥 修復：MAML驗證時需要梯度來做內部適應，不能用no_grad
+        for episode_data in val_epoch_iterator:  # 🔥 直接迭代
+    
+            # 🔥 直接傳遞episode_data
+            predicted_labels, true_labels, meta_loss, batch_task_losses = MAMLPlusPlusSolver(
                 meta_model,
-                optimizer,
-                x,
+                None,
+                episode_data,  # 🔥 直接傳遞
                 CFG.n_way,
                 CFG.k_shot,
                 CFG.q_query,
                 loss_fn,
                 inner_train_step=CFG.val_inner_train_step,
-                train=False, # Set train=False
+                train=False,
                 epoch=epoch,
                 step_weights=step_weights,
-                use_first_order_epochs=CFG.use_first_order_epochs
+                use_first_order_epochs=CFG.use_first_order_epochs,
+                return_labels=True 
             )
-            val_acc.append(acc)
+            
+            all_val_preds.extend(predicted_labels)
+            all_val_trues.extend(true_labels)
+            all_val_loss.append(meta_loss.item())
         
-        avg_val_acc = np.mean(val_acc)
-        print(f"Validation accuracy: {avg_val_acc*100:.3f}%")
+        # Calculate metrics *after* the loop, on all collected labels
+        avg_val_loss = np.mean(all_val_loss)
+        avg_val_acc = accuracy_score(all_val_trues, all_val_preds)
+        avg_val_precision = precision_score(all_val_trues, all_val_preds, average='macro', zero_division=0)
+        avg_val_recall = recall_score(all_val_trues, all_val_preds, average='macro', zero_division=0)
+        avg_val_f1 = f1_score(all_val_trues, all_val_preds, average='macro', zero_division=0)
+
+        # Print progress with more detailed info (like MAML.py)
+        print(f"Val Loss: {avg_val_loss:.3f} | Val Acc: {avg_val_acc*100:.2f}%")
+        print(f"Train F1: {avg_train_f1:.3f} | Val F1: {avg_val_f1:.3f}")
+        
+        # Check for overfitting (like MAML.py)
+        acc_gap = avg_train_acc - avg_val_acc
+        if acc_gap > 0.3:
+            print(f"Warning: Possible overfitting! Gap: {acc_gap*100:.1f}%")
         
         train_metrics = {
             "loss": avg_train_loss,
-            "accuracy": avg_train_acc
+            "accuracy": avg_train_acc,
+            "precision": avg_train_precision,
+            "recall": avg_train_recall,
+            "f1_macro": avg_train_f1
         }
+        # Add all metrics to the log
         val_metrics = {
-            "accuracy": avg_val_acc
+            "loss": avg_val_loss,
+            "accuracy": avg_val_acc,
+            "precision": avg_val_precision,
+            "recall": avg_val_recall,
+            "f1_macro": avg_val_f1
         }
         logger.add(epoch, train_metrics, val_metrics)
         
+        # Save best model (enhanced like MAML.py)
         if logger.should_save_best(avg_val_acc):
             print(f"New best model found! Saving to {logger.model_path}")
-            torch.save(meta_model.state_dict(), logger.model_path)
+            
+            cfg_dict = {
+                k: v for k, v in vars(CFG).items()
+                if not k.startswith("__") and isinstance(
+                    v, (int, float, str, bool, list, type(None))
+                )
+            }
+            
+            torch.save({
+                "model_state_dict": meta_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "cfg": cfg_dict,
+                "epoch": epoch,
+                "val_accuracy": avg_val_acc,
+                "hyperparameters": {
+                    'n_way': CFG.n_way,
+                    'k_shot': CFG.k_shot,
+                    'q_query': CFG.q_query,
+                    'input_dim': CFG.input_dim,
+                    'inner_lr': CFG.inner_lr,
+                    'meta_lr': CFG.meta_lr,
+                    'train_inner_train_step': CFG.train_inner_train_step,
+                    'use_first_order_epochs': CFG.use_first_order_epochs
+                },
+            }, logger.model_path)
+            
+            print(f"Saved best model: {logger.model_path} "
+                f"(val_accuracy={avg_val_acc*100:.2f}%)")
+            best_val_acc = avg_val_acc
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
             
         # Update scheduler
         scheduler.step()
+        
+        # Early stopping check (like MAML.py)
+        if early_stopping(avg_val_acc):
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            print(f"Best validation accuracy: {early_stopping.best_val_acc*100:.2f}%")
+            break
+        
+        # Hard stop after 40 epochs of no improvement (for 200 epoch training)
+        if no_improve_epochs >= 40:
+            print(f"Stopping: No improvement for {no_improve_epochs} epochs")
+            break
 
-    print("\nMAML++ Training completed.")
-    print(f"Best validation accuracy: {logger.best_val*100:.3f}% at epoch {logger.best_epoch}")
-    print(f"Best model saved to: {logger.model_path}")
 
     # --- 5. Testing (MODIFIED) ---
     print("\n" + "="*50)
@@ -817,12 +784,16 @@ def main():
     # Load best model for testing
     if os.path.exists(logger.model_path):
         print(f"Loading best model from {logger.model_path}")
-        meta_model.load_state_dict(torch.load(logger.model_path, map_location=CFG.device))
+        checkpoint = torch.load(logger.model_path, map_location=CFG.device)
+        if 'model_state_dict' in checkpoint:
+            meta_model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            meta_model.load_state_dict(checkpoint)
     else:
         print("Warning: Best model not found. Testing with the final model.")
         
     test_predicted_labels, test_true_labels, test_task_accuracies = test_maml_plus_plus(
-        meta_model, test_loader, num_test_tasks=CFG.eval_batches * CFG.meta_batch_size
+        meta_model, test_loader, num_test_tasks=20  # Reduced for testing
     )
     
     average_test_accuracy = np.mean(test_task_accuracies)
@@ -832,6 +803,7 @@ def main():
     print(f"Average Test Task Accuracy: {average_test_accuracy*100:.3f}% ± {std_test_accuracy*100:.3f}%")
     print(f"Best Task Accuracy: {np.max(test_task_accuracies)*100:.3f}%")
     print(f"Worst Task Accuracy: {np.min(test_task_accuracies)*100:.3f}%")
+    print(f"Total test samples: {len(test_predicted_labels)}")
     
     # Save MAML++ test results
     results_df = pd.DataFrame({
@@ -842,15 +814,22 @@ def main():
 
     results_csv_path = os.path.join(CFG.log_dir, 'maml_plus_plus_test_predictions.csv')
     results_df.to_csv(results_csv_path, index=False)
-    print(f"MMAML++ test results saved as {results_csv_path}")
+    print(f"MAML++ test results saved as {results_csv_path}")
     
-    # Calculate detailed metrics
-    print("\nDetailed Classification Report:")
+    # Calculate detailed metrics (like MAML.py)
+    print("\nClassification Report:")
     print(classification_report(test_true_labels, test_predicted_labels, 
-                              target_names=[f'Class {i}' for i in range(CFG.n_way)]))
+                              target_names=[f'Class_{i}' for i in range(CFG.n_way)]))
     
     print("\nConfusion Matrix:")
     print(confusion_matrix(test_true_labels, test_predicted_labels))
+    
+    # Training summary (like MAML.py)
+    print("\nMAML++ Training completed!")
+    print(f"Best validation accuracy: {best_val_acc*100:.2f}%")
+    print(f"Logs saved at: {logger.path}")
+    print(f"Best model saved at: {logger.model_path}")
+    print(f"Test results saved at: {results_csv_path}")
 
 
 if __name__ == "__main__":
