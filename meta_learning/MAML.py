@@ -63,14 +63,14 @@ except ImportError as e:
 class CFG:
     """Configuration parameters for MAML meta-learning."""
     n_way = 3
-    k_shot = 1  
+    k_shot = 5  
     q_query = 15
     input_dim = 1280
 
-    inner_lr = 0.005 
-    meta_lr = 0.0005
+    inner_lr = 0.01 
+    meta_lr = 0.001
     inner_steps_train = 5  
-    inner_steps_val = 5
+    inner_steps_val = 10
 
     meta_batch_size = 16  
     max_epoch = 200  

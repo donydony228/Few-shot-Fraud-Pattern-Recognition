@@ -1,6 +1,7 @@
 # python -m meta_learning.MAML++
 import os
 import sys
+sys.path.append('.') 
 import random
 import json
 import glob
@@ -70,22 +71,23 @@ class CFG:
     """Configuration parameters for MAML++ meta-learning."""
     # Task definition - 固定1-shot設置
     n_way = 3
-    k_shot = 1  # 固定1-shot
+    k_shot = 5  # 固定1-shot
     q_query = 15  # 減少query數量以平衡訓練速度
     input_dim = 1280
 
     # MAML++ Hyperparameters - 優化for 200 epochs
-    train_inner_train_step = 5  # 增加內部步驟，1-shot需要更多適應
-    val_inner_train_step = 5    # 測試時也用更多步驟
-    inner_lr = 0.01             # 保持合理的內部學習率
-    meta_lr = 0.0003            # 降低meta學習率for更長訓練
-    meta_batch_size = 16        # 減小batch size提高穩定性
+    train_inner_train_step = 3  # 增加內部步驟，1-shot需要更多適應
+    val_inner_train_step = 3    # 測試時也用更多步驟
+    inner_lr = 0.0005             # 保持合理的內部學習率
+    meta_lr = 0.0001            # 降低meta學習率for更長訓練
+    meta_batch_size = 32        # 減小batch size提高穩定性
     max_epoch = 200             # 增加到200 epochs
     eval_batches = 20
 
     # MAML++ specific hyperparameters - 調整for長期訓練
-    use_first_order_epochs = 60  # 前60epochs用一階，後140epochs用二階
-    step_weights_initial = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1]  # 多步驟權重
+    use_first_order_epochs = 100  # 前100epochs用一階，後100epochs用二階
+    # step_weights_initial = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1]  # 多步驟權重
+    step_weights_initial = [0.2, 0.4, 0.6, 0.8, 1.0]
 
     # Device
     if torch.cuda.is_available():
