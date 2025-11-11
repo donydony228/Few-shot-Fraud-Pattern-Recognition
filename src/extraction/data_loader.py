@@ -1,10 +1,12 @@
 import os
 import numpy as np
 import pandas as pd
+import torch
+import random
+
 from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.model_selection import train_test_split
 from typing import List, Tuple, Dict
-import torch
 
 random_seed = 15 # Group number
 
@@ -25,7 +27,9 @@ class FeatureDataset(Dataset):
         path = self.file_paths[idx]
         label = os.path.basename(os.path.dirname(path))
         feature = np.load(path)
-        return torch.tensor(feature, dtype=torch.float32), torch.tensor(self.label_to_idx[label])
+        feature = torch.tensor(feature, dtype=torch.float32)
+        feature = torch.nn.functional.normalize(feature, p=2, dim=0)
+        return feature, torch.tensor(self.label_to_idx[label])
 
 
 def get_label_splits(split_csv_path: str) -> Tuple[List[str], List[str]]:
@@ -38,30 +42,39 @@ def get_label_splits(split_csv_path: str) -> Tuple[List[str], List[str]]:
     return seen_labels, unseen_labels
 
 
-def collect_file_paths(base_dir: str, labels: List[str]) -> List[str]:
+def collect_file_paths(base_dir: str, labels: List[str]) -> Dict[str, List[str]]:
     """
-    Collects all .npy feature file paths for given labels.
+    Collects all .npy feature file paths for each label.
+    Returns a dict: {label: [file_paths]}
     """
-    paths = []
+    paths = {}
     for label in labels:
         label_dir = os.path.join(base_dir, label)
         if not os.path.exists(label_dir):
-            raise FileNotFoundError(f'Directory not found for label: {label}')
-        for fname in os.listdir(label_dir):
-            if fname.endswith('.npy'):
-                paths.append(os.path.join(label_dir, fname))
+            raise FileNotFoundError(f"Directory not found for label: {label}")
+        npy_files = [os.path.join(label_dir, f) for f in os.listdir(label_dir) if f.endswith('.npy')]
+        if len(npy_files) == 0:
+            raise ValueError(f"No .npy files found for label: {label}")
+        paths[label] = npy_files
     return paths
+
+
+def get_n_samples(unseen_class_files, num):
+    n_shot_files = []
+    for label, files in unseen_class_files.items():
+            n_select = min(num, len(files))
+            n_shot_files.extend(random.sample(files, n_select))
+    return n_shot_files
 
 
 def load_data(
     features_dir: str,
     split_csv_path: str,
     batch_size: int = 64,
-    val_ratio: float = 0.1,
-    test_ratio: float = 0.1,
+    test_ratio: float = 0.2,
     generalized: bool = False,
     num_workers: int = 4,
-    one_shot = False
+    n_shot = 0
 ) -> Tuple[Dict[str, FeatureDataset], Dict[str, DataLoader]]:
     """
     Creates PyTorch dataloaders for Zero-Shot Learning setup.
@@ -80,21 +93,29 @@ def load_data(
     """
     seen_labels, unseen_labels = get_label_splits(split_csv_path)
 
-    seen_files = collect_file_paths(features_dir, seen_labels)
-    unseen_files = collect_file_paths(features_dir, unseen_labels)
+    # Collect all class files
+    seen_class_files = collect_file_paths(features_dir, seen_labels)
+    unseen_class_files = collect_file_paths(features_dir, unseen_labels)
 
-    # Encode labels to integers
-    all_labels = sorted(list(set(seen_labels + unseen_labels)))
-    label_to_idx = {label: i for i, label in enumerate(all_labels)}
+    # Determine minimum count across ALL classes (seen + unseen)
+    min_samples = min(
+        min(len(v) for v in seen_class_files.values()),
+        min(len(v) for v in unseen_class_files.values())
+    )
 
-    np.random.seed(random_seed)
+    # Sample the same number of examples per class
+    balanced_seen_files, balanced_unseen_files = [], []
+    for label, files in seen_class_files.items():
+        balanced_seen_files.extend(random.sample(files, min_samples))
+    for label, files in unseen_class_files.items():
+        balanced_unseen_files.extend(random.sample(files, min_samples))
 
-    # Extract class labels corresponding to each file path
-    seen_file_labels = [os.path.basename(os.path.dirname(p)) for p in seen_files]
+    # Extract class labels for stratification
+    seen_file_labels = [os.path.basename(os.path.dirname(p)) for p in balanced_seen_files]
 
-    # Stratified split so every seen class appears in both splits
-    train_files, test_seen_files, train_labels, test_seen_labels = train_test_split(
-        seen_files,
+    # Stratified split for seen classes
+    train_files, test_seen_files, _, _ = train_test_split(
+        balanced_seen_files,
         seen_file_labels,
         test_size=test_ratio,
         random_state=random_seed,
@@ -102,29 +123,30 @@ def load_data(
         stratify=seen_file_labels
     )
 
-    # One-shot unseen samples (1 sample per unseen class)
-    one_shot_files = []
-    if one_shot:
-        for label in unseen_labels:
-            label_dir = os.path.join(features_dir, label)
-            npy_files = [f for f in os.listdir(label_dir) if f.endswith('.npy')]
-            if npy_files:
-                one_shot_files.append(os.path.join(label_dir, np.random.choice(npy_files)))
+    # Few-shot unseen addition (n_shot per unseen class)
+    if n_shot:
+        # Called twice to get different samples selected randomly
+        train_files += get_n_samples(unseen_class_files, n_shot)
+        test_seen_files += get_n_samples(unseen_class_files, n_shot)
 
-        # Add one-shot unseen samples to both train and test_seen
-        train_files += one_shot_files
-        test_seen_files += one_shot_files
 
-    # Dataset for seen classes
-    train_set = FeatureDataset(train_files, label_to_idx, all_labels)
-    test_seen_set = FeatureDataset(test_seen_files, label_to_idx, all_labels)
+    # Encode labels to integers
+    all_labels = sorted(list(set(seen_labels + unseen_labels)))
+    label_to_idx = {label: i for i, label in enumerate(all_labels)}
 
-    # Dataset for unseen classes
+    # Label encoding
+    all_labels = sorted(list(set(seen_labels + unseen_labels)))
+    label_to_idx = {label: i for i, label in enumerate(all_labels)}
+
+    # Build datasets
+    train_set = FeatureDataset(train_files, label_to_idx, all_labels if n_shot > 0 else seen_labels)
+    test_seen_set = FeatureDataset(test_seen_files, label_to_idx, all_labels if n_shot > 0 else seen_labels)
+
     if generalized:
-        combined_files = seen_files + unseen_files
+        combined_files = balanced_seen_files + balanced_unseen_files
         test_unseen_set = FeatureDataset(combined_files, label_to_idx, all_labels)
     else:
-        test_unseen_set = FeatureDataset(unseen_files, label_to_idx, unseen_labels)
+        test_unseen_set = FeatureDataset(balanced_unseen_files, label_to_idx, unseen_labels)
 
     datasets = {
         'train': train_set,
